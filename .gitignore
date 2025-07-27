@@ -1,6 +1,7 @@
 # Gradle
 .gradle/
 build/
+target/
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/
@@ -84,6 +85,11 @@ data/
 *.rocksdb
 temp/
 tmp/
+
+# Compiled class files
+*.class
+target/classes/
+target/test-classes/
 
 # RocksDB data directories
 data/
