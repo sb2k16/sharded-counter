@@ -1,0 +1,48 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'com.distributedcounter'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // RocksDB
+    implementation 'org.rocksdb:rocksdbjni:8.7.3'
+    
+    // Netty for networking
+    implementation 'io.netty:netty-all:4.1.100.Final'
+    
+    // JSON processing
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.15.2'
+    
+    // Logging
+    implementation 'org.slf4j:slf4j-api:2.0.7'
+    implementation 'ch.qos.logback:logback-classic:1.4.8'
+    
+    // Testing
+    testImplementation 'junit:junit:4.13.2'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+application {
+    mainClass = 'com.distributedcounter.ShardNode'
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': 'com.distributedcounter.ShardNode'
+    }
+}
+
+test {
+    useJUnit()
+} 
