@@ -513,11 +513,9 @@ When replicas diverge, the system must resolve conflicts to maintain consistency
 
 Timestamp-based resolution uses timestamps to determine the winning value:
 
-<details>
-<summary><strong>Timestamp-Based Conflict Resolution Implementation</strong></summary>
+Timestamp-based conflict resolution uses timestamps to determine the winning value:
 
 ```java
-// Timestamp-based conflict resolution
 public class TimestampBasedConflictResolver {
     
     public ConflictResolutionResult resolveTimestampConflict(
