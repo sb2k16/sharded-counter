@@ -438,11 +438,9 @@ Read operations involve several performance trade-offs that must be carefully co
 
 The system must balance response latency with data completeness:
 
-<details>
-<summary><strong>Latency vs. Completeness Implementation</strong></summary>
+Latency vs. completeness trade-offs are configurable:
 
 ```java
-// Configurable latency vs. completeness trade-off
 public class AdaptiveReadHandler {
     private final Map<String, Long> shardLatencies = new ConcurrentHashMap<>();
     private final double completenessThreshold;
@@ -480,14 +478,13 @@ public class AdaptiveReadHandler {
 }
 ```
 
-</details>
+For the complete adaptive read handler implementation with configurable thresholds, see **Listing 4.8** in the appendix.
 
 ### Parallel vs. Sequential Queries
 
 The system can choose between parallel and sequential query strategies:
 
-<details>
-<summary><strong>Parallel vs. Sequential Query Implementation</strong></summary>
+Parallel and sequential query strategies provide different trade-offs:
 
 ```java
 // Parallel query strategy
@@ -548,11 +545,9 @@ The read operation system implements several caching strategies to improve perfo
 
 The coordinator can cache aggregated results:
 
-<details>
-<summary><strong>Coordinator-Level Caching Implementation</strong></summary>
+Coordinator-level caching improves read performance:
 
 ```java
-// Coordinator-level caching for aggregated results
 public class CoordinatorCache {
     private final Cache<String, CachedResult> cache;
     private final Duration ttl;
@@ -597,17 +592,15 @@ public class CoordinatorCache {
 }
 ```
 
-</details>
+For the complete coordinator-level caching implementation with TTL management, see **Listing 4.9** in the appendix.
 
 ### Cache Invalidation
 
 The cache must be invalidated when data changes:
 
-<details>
-<summary><strong>Cache Invalidation Implementation</strong></summary>
+Cache invalidation ensures data consistency:
 
 ```java
-// Cache invalidation on write operations
 public class CacheInvalidationHandler {
     private final CoordinatorCache cache;
     private final Set<String> invalidatedKeys = ConcurrentHashMap.newKeySet();
@@ -636,7 +629,7 @@ public class CacheInvalidationHandler {
 }
 ```
 
-</details>
+For the complete cache invalidation implementation with write-through strategies, see **Listing 4.10** in the appendix.
 
 ### Cache Consistency
 

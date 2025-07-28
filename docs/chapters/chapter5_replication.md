@@ -405,11 +405,9 @@ Eventual consistency provides:
 
 Read-your-writes consistency ensures clients see their own writes:
 
-<details>
-<summary><strong>Read-Your-Writes Implementation</strong></summary>
+Read-your-writes consistency ensures clients see their own writes:
 
 ```java
-// Read-your-writes consistency implementation
 public class ReadYourWritesManager {
     private final ReplicationConfig config;
     private final Map<String, Long> clientTimestamps = new ConcurrentHashMap<>();
