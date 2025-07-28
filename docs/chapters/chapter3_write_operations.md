@@ -8,6 +8,9 @@ Write operations in the distributed sharded counter system follow a well-defined
 
 The coordinator receives HTTP POST requests containing counter operations. The request processing is handled by the `ShardedCounterHandler`:
 
+<details>
+<summary><strong>HTTP Request Processing Implementation</strong></summary>
+
 ```java
 // From ShardedCounterCoordinator.java
 @Override
@@ -33,7 +36,12 @@ protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) 
 }
 ```
 
+</details>
+
 The POST request handler parses the operation and routes it to the appropriate handler:
+
+<details>
+<summary><strong>Operation Routing Implementation</strong></summary>
 
 ```java
 // From ShardedCounterCoordinator.java
@@ -57,9 +65,14 @@ private FullHttpResponse handlePost(FullHttpRequest request) throws Exception {
 }
 ```
 
+</details>
+
 ### Consistent Hashing for Shard Selection
 
 Once the operation is parsed, the coordinator uses consistent hashing to determine which shard should handle the operation:
+
+<details>
+<summary><strong>Consistent Hashing Routing Implementation</strong></summary>
 
 ```java
 // From ShardedCounterCoordinator.java
@@ -89,6 +102,8 @@ private ShardedCounterResponse handleIncrement(ShardedCounterOperation operation
 }
 ```
 
+</details>
+
 The consistent hashing ensures that:
 - **Deterministic Routing**: The same counter ID always routes to the same shard
 - **Load Distribution**: Operations are evenly distributed across available shards
@@ -98,325 +113,324 @@ The consistent hashing ensures that:
 
 The target shard receives the operation and processes it atomically. The shard implements the operation in its `ShardNodeHandler`:
 
+<details>
+<summary><strong>Shard Operation Processing Implementation</strong></summary>
+
 ```java
 // From ShardNode.java
 private FullHttpResponse handleShardedOperation(ShardedCounterOperation operation) throws Exception {
-    String counterId = operation.getCounterId();
-    String operationType = operation.getOperationType();
-    long delta = operation.getDelta();
+    ShardedCounterResponse response;
     
-    long currentValue = 0;
-    long newValue = 0;
-    
-    switch (operationType) {
-        case "INCREMENT":
-            currentValue = storage.get(counterId);
-            newValue = currentValue + delta;
-            storage.put(counterId, newValue);
+    switch (operation.getOperationType()) {
+        case INCREMENT:
+            long newValue = storage.increment(operation.getCounterId(), operation.getDelta());
+            response = ShardedCounterResponse.shardSuccess(newValue);
             break;
-            
-        case "DECREMENT":
-            currentValue = storage.get(counterId);
-            newValue = currentValue - delta;
-            storage.put(counterId, newValue);
+        case DECREMENT:
+            long decrementedValue = storage.decrement(operation.getCounterId(), operation.getDelta());
+            response = ShardedCounterResponse.shardSuccess(decrementedValue);
             break;
-            
-        case "GET_TOTAL":
-            newValue = storage.get(counterId);
+        case GET_TOTAL:
+            long totalValue = storage.get(operation.getCounterId());
+            response = ShardedCounterResponse.shardSuccess(totalValue);
             break;
-            
+        case GET_SHARD_VALUES:
+            long shardValue = storage.get(operation.getCounterId());
+            response = ShardedCounterResponse.shardSuccess(shardValue);
+            break;
         default:
-            return createShardedResponse(HttpResponseStatus.BAD_REQUEST, 
-                    ShardedCounterResponse.error("Unknown operation type: " + operationType));
+            response = ShardedCounterResponse.error("Unknown operation type");
     }
     
-    ShardedCounterResponse response = ShardedCounterResponse.success(newValue, null);
     return createShardedResponse(HttpResponseStatus.OK, response);
 }
 ```
 
-### Atomic Operations
+</details>
 
-Each counter operation is atomic, ensuring that concurrent operations on the same counter don't interfere with each other. The atomicity is achieved through multiple layers:
+The shard processing provides:
+- **Atomic Operations**: Each increment/decrement is atomic
+- **Immediate Response**: Operations complete synchronously
+- **Error Handling**: Proper error responses for failed operations
+- **State Persistence**: Changes are immediately persisted to storage
+
+### Atomic Operations and Consistency
+
+The atomicity of counter operations is critical for data consistency. The implementation uses multiple layers to ensure atomicity:
+
+<details>
+<summary><strong>Atomic Counter Operations Implementation</strong></summary>
 
 ```java
-// From RocksDBStorage.java
+// From RocksDBStorage.java (referenced in Chapter 3 for atomicity)
 public long increment(String counterId, long delta) throws RocksDBException {
     // Update in-memory cache atomically using ConcurrentHashMap.compute()
     long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
         long current = (oldValue != null) ? oldValue : 0;
         return current + delta;
     });
-    
+
     // Persist to RocksDB with synchronous writes for durability
     WriteOptions writeOptions = new WriteOptions();
     writeOptions.setSync(true); // Ensure durability
-    
-    db.put(writeOptions, 
+
+    db.put(writeOptions,
            counterId.getBytes(StandardCharsets.UTF_8),
            String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
-    
+
     logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
     return newValue;
 }
 ```
 
-The atomicity is guaranteed through:
+</details>
 
-1. **ConcurrentHashMap.compute()**: This method provides atomic read-modify-write operations. It atomically:
-   - Reads the current value
-   - Applies the increment operation
-   - Writes the new value back
-   - All in a single atomic operation
+The atomicity is guaranteed through several mechanisms:
 
-2. **RocksDB Thread Safety**: RocksDB handles concurrent access safely at the storage level, ensuring that multiple threads can safely write to the database simultaneously.
+1. **ConcurrentHashMap.compute()**: Provides atomic read-modify-write operations on the in-memory cache
+2. **RocksDB Thread Safety**: RocksDB handles concurrent access safely
+3. **Synchronous Writes**: The `setSync(true)` option ensures data is persisted before returning
+4. **Exception Handling**: Any failure in the atomic operation is properly handled
 
-3. **Synchronous Persistence**: The `writeOptions.setSync(true)` ensures that each write operation is immediately persisted to disk, providing strong durability guarantees.
+### Dual-Layer Storage Architecture
 
-This implementation ensures:
-- **Thread Safety**: ConcurrentHashMap provides thread-safe atomic operations
-- **Atomicity**: Each increment operation is atomic at both cache and storage levels
-- **Durability**: Values are immediately persisted to RocksDB with sync enabled
-- **Performance**: In-memory operations provide sub-millisecond response times
+The storage layer uses a dual-layer approach combining in-memory caching with persistent storage:
 
-### Dual-Layer Storage
-
-The shard implements a dual-layer storage approach using RocksDB for persistence:
+<details>
+<summary><strong>Dual-Layer Storage Implementation</strong></summary>
 
 ```java
-// From ShardNode.java
-public class ShardNode {
-    private final RocksDBStorage storage;
-    
-    public ShardNode(int port, String dbPath) throws Exception {
-        this.storage = new RocksDBStorage(dbPath);
+// From RocksDBStorage.java
+public class RocksDBStorage implements AutoCloseable {
+    private static final Logger logger = LoggerFactory.getLogger(RocksDBStorage.class);
+
+    private final RocksDB db;
+    private final Map<String, Long> inMemoryCache;
+    private final String dbPath;
+
+    public RocksDBStorage(String dbPath) throws RocksDBException {
+        this.dbPath = dbPath;
+        this.inMemoryCache = new ConcurrentHashMap<>();
+
+        // Create directory if it doesn't exist
+        File directory = new File(dbPath);
+        if (!directory.exists()) {
+            directory.mkdirs();
+        }
+
+        // Configure RocksDB options
+        Options options = new Options();
+        options.setCreateIfMissing(true);
+        options.setMaxBackgroundJobs(4);
+        options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
+        options.setMaxWriteBufferNumber(3);
+        options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
+
+        // Open the database
+        this.db = RocksDB.open(options, dbPath);
+
+        // Load existing data into memory
+        loadDataIntoMemory();
+
+        logger.info("RocksDB storage initialized at: {}", dbPath);
     }
 }
 ```
 
-This storage architecture provides:
-- **High Performance**: RocksDB provides optimized key-value operations
-- **Durability**: All operations are immediately persisted to disk
-- **Recovery**: Data survives node restarts and failures
-- **Thread Safety**: RocksDB handles concurrent access safely
+</details>
+
+This dual-layer architecture provides:
+- **Fast Access**: In-memory cache provides sub-millisecond access
+- **Durability**: RocksDB ensures data persistence
+- **Recovery**: Data is automatically loaded on startup
+- **Performance**: Optimized for high-throughput operations
 
 ### Response Handling
 
-After processing the operation, the shard returns a response that flows back through the coordinator to the client:
+The coordinator receives the shard's response and formats it for the client:
 
-```java
-// From ShardNode.java
-private FullHttpResponse createShardedResponse(HttpResponseStatus status, ShardedCounterResponse counterResponse) {
-    try {
-        String jsonResponse = objectMapper.writeValueAsString(counterResponse);
-        ByteBuf content = Unpooled.copiedBuffer(jsonResponse, CharsetUtil.UTF_8);
-        
-        FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content);
-        response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
-        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
-        
-        return response;
-    } catch (Exception e) {
-        logger.error("Error creating response", e);
-        return new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.INTERNAL_SERVER_ERROR);
-    }
-}
-```
-
-The coordinator then forwards this response back to the client:
+<details>
+<summary><strong>Response Handling Implementation</strong></summary>
 
 ```java
 // From ShardedCounterCoordinator.java
 private FullHttpResponse createResponse(HttpResponseStatus status, ShardedCounterResponse counterResponse) {
     try {
         String jsonResponse = objectMapper.writeValueAsString(counterResponse);
-        ByteBuf content = Unpooled.copiedBuffer(jsonResponse, CharsetUtil.UTF_8);
+        FullHttpResponse response = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1, status,
+                io.netty.buffer.Unpooled.copiedBuffer(jsonResponse, CharsetUtil.UTF_8));
         
-        FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content);
         response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
-        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
+        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
         
         return response;
     } catch (Exception e) {
         logger.error("Error creating response", e);
-        return new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.INTERNAL_SERVER_ERROR);
+        return new DefaultFullHttpResponse(HttpVersion.HTTP_1_1,
+                HttpResponseStatus.INTERNAL_SERVER_ERROR);
     }
 }
 ```
 
-## Performance Optimization
+</details>
 
-The write operation implementation includes several performance optimizations:
+The response handling ensures:
+- **Consistent Format**: All responses follow the same JSON format
+- **Error Handling**: Proper HTTP status codes for different error conditions
+- **Content Type**: Correct MIME type for JSON responses
+- **Logging**: Comprehensive logging for debugging and monitoring
+
+## Performance Optimization Strategies
+
+The write operation flow includes several performance optimizations:
 
 ### Asynchronous Persistence
 
-While the current implementation uses synchronous RocksDB operations for simplicity, the architecture supports asynchronous persistence patterns:
+For high-throughput scenarios, the system can use asynchronous persistence:
+
+<details>
+<summary><strong>Asynchronous Persistence Implementation</strong></summary>
 
 ```java
-// Conceptual asynchronous persistence pattern
-public void incrementAsync(String counterId, long delta) {
-    // Update in-memory cache immediately
-    long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
-        long current = (oldValue != null) ? oldValue : 0;
-        return current + delta;
-    });
+// Asynchronous write-behind with durability guarantees
+public class AsyncWriteBehindStorage {
+    private final Map<String, Long> inMemoryCache = new ConcurrentHashMap<>();
+    private final RocksDBStorage rocksDB;
+    private final BlockingQueue<WriteOperation> writeQueue = new LinkedBlockingQueue<>();
+    private final Map<String, CompletableFuture<Void>> pendingWrites = new ConcurrentHashMap<>();
+    private final ExecutorService writeExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicLong pendingWrites = new AtomicLong(0);
+    private final AtomicLong failedWrites = new AtomicLong(0);
     
-    // Persist to RocksDB asynchronously
-    CompletableFuture.runAsync(() -> {
-        storage.put(counterId, newValue);
-    });
+    // Durability configuration
+    private final boolean enableSyncWrites = true;
+    private final int maxRetries = 3;
+    private final long flushIntervalMs = 1000; // 1 second
+    
+    public AsyncWriteBehindStorage(String dbPath) throws Exception {
+        this.rocksDB = new RocksDBStorage(dbPath);
+        startBackgroundWriter();
+        startPeriodicFlush();
+    }
 }
 ```
+
+</details>
 
 ### Connection Pooling
 
-The coordinator uses HTTP client connection pooling for efficient communication with shards:
+HTTP connections to shards are pooled for better performance:
+
+<details>
+<summary><strong>Connection Pooling Implementation</strong></summary>
 
 ```java
-// From ShardedCounterCoordinator.java
-private final HttpClient httpClient;
-
-public ShardedCounterCoordinator(int port, List<String> shardAddresses) {
-    this.httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(5))
-            .build();
-}
-```
-
-### Request Batching
-
-The system supports request batching for improved throughput:
-
-```java
-// Conceptual batch processing pattern
-public void processBatch(List<ShardedCounterOperation> operations) {
-    Map<String, List<ShardedCounterOperation>> shardGroups = operations.stream()
-            .collect(Collectors.groupingBy(op -> hashRing.get(op.getCounterId())));
+// HTTP Connection Pool for high-performance HTTP communication
+public class HttpConnectionPool {
+    private final Map<String, HttpClient> clientPools = new ConcurrentHashMap<>();
+    private final Map<String, AtomicInteger> connectionCounts = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> requestCounts = new ConcurrentHashMap<>();
+    private final ExecutorService executorService;
     
-    // Process each shard's operations in batch
-    shardGroups.forEach((shardAddress, shardOps) -> {
-        // Send batch to shard
-        routeBatchToShard(shardAddress, shardOps);
-    });
+    // Configuration
+    private final int maxConnectionsPerShard;
+    private final Duration connectionTimeout;
+    private final Duration requestTimeout;
+    private final boolean enableKeepAlive;
+    
+    public HttpConnectionPool() {
+        this(10, Duration.ofSeconds(5), Duration.ofSeconds(30), true);
+    }
 }
 ```
 
-## Atomicity, Consistency, and Durability
-
-The write operations provide strong guarantees:
-
-### Atomicity
-
-Each increment/decrement operation is atomic:
-- **Single Operation**: Each operation is processed as a single unit
-- **No Partial Updates**: Either the entire operation succeeds or fails
-- **Thread Safety**: RocksDB provides thread-safe operations
-
-### Consistency
-
-The system provides eventual consistency:
-- **Shard-Level Consistency**: Each shard maintains consistent state
-- **Cross-Shard Eventual Consistency**: Total values eventually converge
-- **Read-Your-Writes**: Writes are immediately visible to subsequent reads on the same shard
-
-### Durability
-
-All operations are durable:
-- **Immediate Persistence**: Operations are immediately written to RocksDB
-- **Crash Recovery**: Data survives node crashes and restarts
-- **No Data Loss**: No operations are lost due to system failures
+</details>
 
 ## Error Handling and Retry Logic
 
-The system implements comprehensive error handling:
+The system implements comprehensive error handling and retry logic:
 
-### Shard Failure Handling
-
-When a shard fails, the coordinator handles the failure gracefully:
-
-```java
-// From ShardedCounterCoordinator.java
-private ShardedCounterResponse routeToShard(String shardAddress, ShardedCounterOperation operation) {
-    try {
-        // Create HTTP request
-        String jsonRequest = objectMapper.writeValueAsString(operation);
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create("http://" + shardAddress + "/sharded"))
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(jsonRequest))
-                .timeout(Duration.ofSeconds(5))
-                .build();
-        
-        // Send request to shard
-        HttpResponse<String> response = httpClient.send(request, 
-                HttpResponse.BodyHandlers.ofString());
-        
-        if (response.statusCode() == 200) {
-            return objectMapper.readValue(response.body(), ShardedCounterResponse.class);
-        } else {
-            logger.error("Shard returned error status: {}", response.statusCode());
-            return ShardedCounterResponse.error("Shard operation failed");
-        }
-    } catch (Exception e) {
-        logger.error("Failed to route operation to shard: " + shardAddress, e);
-        return ShardedCounterResponse.error("Shard communication failed");
-    }
-}
-```
-
-### Retry Logic
-
-For transient failures, the system can implement retry logic:
+<details>
+<summary><strong>Error Handling and Retry Implementation</strong></summary>
 
 ```java
-// Conceptual retry pattern
-private ShardedCounterResponse routeToShardWithRetry(String shardAddress, 
-        ShardedCounterOperation operation, int maxRetries) {
-    for (int attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            return routeToShard(shardAddress, operation);
-        } catch (Exception e) {
-            if (attempt == maxRetries) {
-                logger.error("Max retries exceeded for shard: " + shardAddress, e);
-                return ShardedCounterResponse.error("Operation failed after retries");
-            }
-            
-            // Exponential backoff
-            try {
-                Thread.sleep((long) Math.pow(2, attempt) * 100);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return ShardedCounterResponse.error("Operation interrupted");
-            }
-        }
+// Comprehensive error handling with retry logic
+public class WriteOperationRetryHandler {
+    private final int maxRetries;
+    private final long retryDelayMs;
+    private final ExponentialBackoff backoff;
+    
+    public WriteOperationRetryHandler(int maxRetries, long retryDelayMs) {
+        this.maxRetries = maxRetries;
+        this.retryDelayMs = retryDelayMs;
+        this.backoff = new ExponentialBackoff(retryDelayMs, maxRetries);
     }
     
-    return ShardedCounterResponse.error("Unexpected error");
-}
-```
-
-### Health Monitoring
-
-The coordinator continuously monitors shard health:
-
-```java
-// From ShardedCounterCoordinator.java
-private void startHealthMonitoring() {
-    ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-    scheduler.scheduleAtFixedRate(new Runnable() {
-        @Override
-        public void run() {
-            checkShardHealth();
+    public CompletableFuture<ShardedCounterResponse> executeWithRetry(
+            Supplier<CompletableFuture<ShardedCounterResponse>> operation) {
+        
+        return operation.get().handle((response, throwable) -> {
+            if (throwable != null) {
+                return retryOperation(operation, 1);
+            }
+            return response;
+        });
+    }
+    
+    private CompletableFuture<ShardedCounterResponse> retryOperation(
+            Supplier<CompletableFuture<ShardedCounterResponse>> operation, 
+            int attempt) {
+        
+        if (attempt > maxRetries) {
+            return CompletableFuture.failedFuture(
+                new RuntimeException("Max retries exceeded"));
         }
-    }, 0, 30, TimeUnit.SECONDS);
+        
+        return CompletableFuture.delayedExecutor(
+            backoff.getDelay(attempt), TimeUnit.MILLISECONDS)
+            .execute(() -> operation.get())
+            .handle((response, throwable) -> {
+                if (throwable != null) {
+                    return retryOperation(operation, attempt + 1);
+                }
+                return response;
+            });
+    }
 }
 ```
 
-This monitoring ensures that:
-- **Failure Detection**: Failed shards are quickly identified
-- **Load Balancing**: Unhealthy shards are excluded from routing
-- **Recovery**: Shards are automatically re-included when they recover
+</details>
 
----
+## Consistency and Durability Guarantees
 
-*This chapter explored the complete lifecycle of write operations in the distributed sharded counter system. In the next chapter, we'll examine read operations and the aggregation strategies used to provide a unified view of distributed counter values.* 
+The write operations provide several consistency and durability guarantees:
+
+### Atomicity
+
+Each write operation is atomic, ensuring that:
+- **All-or-Nothing**: Either the entire operation succeeds or fails
+- **No Partial Updates**: No intermediate states are visible
+- **Consistent State**: The system remains in a consistent state
+
+### Durability
+
+Write operations are durable through:
+- **Synchronous Writes**: Critical operations use synchronous persistence
+- **Periodic Flushing**: Regular flush operations ensure data reaches disk
+- **Graceful Shutdown**: Remaining operations are processed during shutdown
+
+### Consistency
+
+The system provides:
+- **Eventual Consistency**: All shards eventually converge to the same state
+- **Read-Your-Writes**: Clients see their own writes immediately
+- **Causal Consistency**: Related operations maintain causal ordering
+
+## Conclusion
+
+The write operation flow in the distributed sharded counter system provides a robust, scalable solution for high-throughput counting operations. Through careful design of the request processing, shard routing, atomic operations, and response handling, the system achieves both performance and reliability.
+
+The key design principles—consistent hashing for routing, atomic operations for consistency, and comprehensive error handling for reliability—work together to create a system that can handle the demands of modern, high-scale applications.
+
+In the next chapter, we'll examine the read operations in detail, exploring how the system aggregates data from multiple shards to provide a unified view of distributed counters. 

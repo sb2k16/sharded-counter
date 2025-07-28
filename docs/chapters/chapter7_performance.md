@@ -16,6 +16,9 @@ The distributed sharded counter system achieves remarkable performance improveme
 
 **Why This Matters**: Understanding these performance characteristics helps in capacity planning, cost optimization, and system design decisions. The model provides quantitative insights into when to scale and how much performance improvement to expect.
 
+<details>
+<summary>Performance Model Implementation</summary>
+
 ```java
 // Performance model for distributed sharded counter
 public class PerformanceModel {
@@ -56,6 +59,7 @@ public class PerformanceModel {
     }
 }
 ```
+</details>
 
 ### Real-World Performance Characteristics
 
@@ -78,6 +82,9 @@ public class PerformanceModel {
 **Implementation Strategy**: The optimized HTTP client uses connection pooling with configurable pool sizes, connection timeouts, and automatic connection reuse. It also implements proper error handling and retry logic for failed connections.
 
 **When to Use**: This optimization is essential for any production deployment where you expect more than a few hundred requests per second. The benefits become more pronounced as the request rate increases.
+
+<details>
+<summary>Optimized HTTP Client Implementation</summary>
 
 ```java
 // Enhanced HTTP client with connection pooling
@@ -119,6 +126,7 @@ public class OptimizedHttpClient {
     }
 }
 ```
+</details>
 
 ### 2. Request Batching and Aggregation
 
@@ -150,6 +158,9 @@ public class OptimizedHttpClient {
 - **Batch Timeout**: How long to wait before processing a partial batch
 - **Retry Strategy**: Number of retries and backoff timing
 - **Durability Level**: Whether to use synchronous or asynchronous persistence
+
+<details>
+<summary>Batch Processing Implementation</summary>
 
 ```java
 // Batch processing for high-throughput scenarios with durability guarantees
@@ -569,6 +580,8 @@ public class AsyncWriteBehindStorage {
     }
 }
 ```
+</details>
+```
 
 ### 4. Read Optimization with Caching
 
@@ -599,6 +612,9 @@ public class AsyncWriteBehindStorage {
 - **TTL Settings**: How long to keep data in each cache level
 - **Eviction Policies**: How to handle cache full scenarios
 - **Warming Strategies**: How to populate cache on startup
+
+<details>
+<summary>Multi-Level Caching Implementation</summary>
 
 ```java
 // Multi-level caching for read optimization
@@ -669,6 +685,8 @@ public class OptimizedReadCache {
     }
 }
 ```
+</details>
+```
 
 ## Advanced Bottleneck Identification and Resolution
 
@@ -704,6 +722,9 @@ public class OptimizedReadCache {
 - **Performance Optimization**: Use metrics to optimize system configuration
 - **Capacity Planning**: Use historical data for capacity planning
 - **Debugging**: Detailed metrics help debug performance issues
+
+<details>
+<summary>Performance Monitoring Implementation</summary>
 
 ```java
 // Comprehensive performance monitoring
@@ -775,6 +796,8 @@ public class PerformanceMonitor {
     }
 }
 ```
+</details>
+```
 
 ### 2. Dynamic Load Balancing
 
@@ -808,6 +831,9 @@ public class PerformanceMonitor {
 - **Failure Thresholds**: When to consider a shard unhealthy
 - **Recovery Criteria**: When to re-include a previously failed shard
 - **Routing Weights**: How to adjust routing based on performance
+
+<details>
+<summary>Adaptive Load Balancer Implementation</summary>
 
 ```java
 // Adaptive load balancing based on performance metrics

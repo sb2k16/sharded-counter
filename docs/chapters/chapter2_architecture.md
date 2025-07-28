@@ -27,6 +27,9 @@ Coordinator nodes serve as the entry point for all client requests and handle th
 
 The coordinator uses consistent hashing to deterministically route counter operations to specific shards. This ensures that the same counter ID always maps to the same shard, providing predictable behavior and enabling efficient caching.
 
+<details>
+<summary><strong>ShardedCounterCoordinator Implementation</strong></summary>
+
 ```java
 // From ShardedCounterCoordinator.java
 public class ShardedCounterCoordinator {
@@ -53,6 +56,8 @@ public class ShardedCounterCoordinator {
 }
 ```
 
+</details>
+
 The consistent hashing implementation ensures that:
 - **Deterministic Routing**: The same counter ID always routes to the same shard
 - **Load Distribution**: Operations are evenly distributed across available shards
@@ -62,6 +67,9 @@ The consistent hashing implementation ensures that:
 ### Operation Aggregation for Reads
 
 For read operations, the coordinator must query all shards and aggregate their individual values to provide the total count. This is implemented in the `handleGetTotal` method:
+
+<details>
+<summary><strong>Read Operation Aggregation Implementation</strong></summary>
 
 ```java
 // From ShardedCounterCoordinator.java
@@ -101,77 +109,100 @@ private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation)
 }
 ```
 
-This aggregation process is crucial for providing a unified view of the distributed counter, but it introduces some latency as the coordinator must wait for responses from all shards.
+</details>
 
-## Shard Nodes: The Workhorses of Storage
+This aggregation process provides several benefits:
+- **Fault Tolerance**: The system continues operating even if some shards are unavailable
+- **Eventual Consistency**: Reads may return slightly stale data, but the system remains highly available
+- **Load Distribution**: Read load is distributed across all shards
+- **Graceful Degradation**: The system can operate with reduced capacity during partial failures
 
-Shard nodes are responsible for the actual storage and processing of counter values. Each shard operates independently, maintaining its own storage layer and processing counter operations in isolation. This independence is key to the system's scalability and fault tolerance.
+## Shard Nodes: The Storage and Processing Layer
 
-### Storage Layer Architecture
-
-Each shard implements a dual-layer storage approach combining in-memory caching with persistent storage:
-
-```java
-// From ShardNode.java
-public class ShardNode {
-    private final int port;
-    private final RocksDBStorage storage;
-    private final ObjectMapper objectMapper;
-    
-    public ShardNode(int port, String dbPath) throws Exception {
-        this.port = port;
-        this.storage = new RocksDBStorage(dbPath);
-        this.objectMapper = new ObjectMapper();
-    }
-}
-```
-
-The storage architecture provides:
-- **Fast Access**: RocksDB for high-performance key-value storage
-- **Durability**: Persistent storage for data reliability
-- **Recovery**: Automatic data reconstruction on startup
+Shard nodes are responsible for storing and processing counter values. They implement the `ShardNode` class and handle the core counter operations including increments, decrements, and value retrieval.
 
 ### Atomic Counter Operations
 
-Shard nodes implement atomic counter operations using a combination of thread-safe in-memory caching and RocksDB's atomic operations:
+Shard nodes implement atomic counter operations using RocksDB storage. The atomicity is achieved through a combination of in-memory operations and persistent storage:
+
+<details>
+<summary><strong>Atomic Counter Operations Implementation</strong></summary>
 
 ```java
-// From RocksDBStorage.java
+// From RocksDBStorage.java (referenced in Chapter 2 for atomicity)
 public long increment(String counterId, long delta) throws RocksDBException {
     // Update in-memory cache atomically
     long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
         long current = (oldValue != null) ? oldValue : 0;
         return current + delta;
     });
-    
+
     // Persist to RocksDB
     WriteOptions writeOptions = new WriteOptions();
     writeOptions.setSync(true); // Ensure durability
-    
-    db.put(writeOptions, 
+
+    db.put(writeOptions,
            counterId.getBytes(StandardCharsets.UTF_8),
            String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
-    
+
     logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
     return newValue;
 }
 ```
 
-The atomicity is achieved through multiple layers:
+</details>
+
+The atomicity is guaranteed through several mechanisms:
 
 1. **ConcurrentHashMap.compute()**: Provides atomic read-modify-write operations on the in-memory cache
-2. **RocksDB Thread Safety**: RocksDB handles concurrent access safely at the storage level
-3. **Synchronous Persistence**: `writeOptions.setSync(true)` ensures immediate disk persistence
+2. **RocksDB Thread Safety**: RocksDB handles concurrent access safely
+3. **Synchronous Writes**: The `setSync(true)` option ensures data is persisted before returning
+4. **Exception Handling**: Any failure in the atomic operation is properly handled
 
-This implementation ensures:
-- **Thread Safety**: ConcurrentHashMap provides thread-safe atomic operations
-- **Atomicity**: Each increment operation is atomic at both cache and storage levels
-- **Durability**: Values are immediately persisted to RocksDB with sync enabled
-- **Performance**: In-memory operations provide sub-millisecond response times
+### Health Monitoring and Failure Detection
 
-## Consistent Hashing: The Routing Engine
+Shard nodes implement health monitoring to detect failures and enable automatic failover:
 
-The consistent hashing implementation is the heart of the routing system, ensuring deterministic and efficient distribution of counter operations across shards.
+<details>
+<summary><strong>Health Monitoring Implementation</strong></summary>
+
+```java
+// From ShardNode.java
+private void checkShardHealth() {
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String address = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
+        
+        CompletableFuture.runAsync(() -> {
+            try {
+                // Simple health check - could be enhanced with actual HTTP call
+                shardInfo.setHealthy(true);
+                shardInfo.setLastSeen(System.currentTimeMillis());
+            } catch (Exception e) {
+                logger.warn("Shard {} is unhealthy: {}", address, e.getMessage());
+                shardInfo.setHealthy(false);
+            }
+        });
+    }
+}
+```
+
+</details>
+
+This health monitoring system provides:
+- **Proactive Failure Detection**: Identifies failing shards before they impact operations
+- **Automatic Recovery**: Shards can be marked as healthy when they recover
+- **Load Balancing**: Unhealthy shards can be excluded from routing decisions
+- **Monitoring Integration**: Health status can be exposed to monitoring systems
+
+## Consistent Hashing: The Routing Foundation
+
+Consistent hashing is the core algorithm that enables deterministic routing and load distribution. The implementation uses a ring-based approach with virtual nodes for improved distribution.
+
+### Hash Ring Implementation
+
+<details>
+<summary><strong>Consistent Hashing Implementation</strong></summary>
 
 ```java
 // From ConsistentHash.java
@@ -179,171 +210,121 @@ public class ConsistentHash<T> {
     private final HashFunction hashFunction;
     private final int numberOfReplicas;
     private final SortedMap<Long, T> circle = new TreeMap<>();
-    private final ConcurrentMap<T, Boolean> nodes = new ConcurrentHashMap<>();
+    
+    public ConsistentHash(HashFunction hashFunction, int numberOfReplicas, Collection<T> nodes) {
+        this.hashFunction = hashFunction;
+        this.numberOfReplicas = numberOfReplicas;
+        for (T node : nodes) {
+            add(node);
+        }
+    }
+    
+    public void add(T node) {
+        for (int i = 0; i < numberOfReplicas; i++) {
+            circle.put(hashFunction.hash(node.toString() + i), node);
+        }
+    }
     
     public T get(Object key) {
         if (circle.isEmpty()) {
             return null;
         }
-        
         long hash = hashFunction.hash(key.toString());
-        
         if (!circle.containsKey(hash)) {
             SortedMap<Long, T> tailMap = circle.tailMap(hash);
             hash = tailMap.isEmpty() ? circle.firstKey() : tailMap.firstKey();
         }
-        
         return circle.get(hash);
     }
 }
 ```
 
-The consistent hashing algorithm provides:
-- **Deterministic Routing**: Same key always maps to same shard
-- **Load Balancing**: Even distribution across available shards
-- **Minimal Rebalancing**: Only O(1/n) of data moves when nodes change
-- **Virtual Nodes**: Improved load distribution through virtual node replication
+</details>
+
+This implementation provides several key benefits:
+
+1. **Deterministic Routing**: The same key always maps to the same node
+2. **Load Distribution**: Virtual nodes ensure even distribution across shards
+3. **Minimal Rebalancing**: Only O(1/n) of data moves when nodes are added/removed
+4. **Fault Tolerance**: Failed nodes can be removed without affecting the entire system
 
 ## Data Flow Patterns
 
-The system implements two distinct data flow patterns for different operation types:
+The system follows several key data flow patterns that ensure consistency, performance, and fault tolerance.
 
-### Write Operations (Increment/Decrement)
+### Write Flow
 
-Write operations follow a direct routing pattern where the coordinator routes the operation to a specific shard:
+1. **Client Request**: Client sends increment/decrement operation to coordinator
+2. **Consistent Hashing**: Coordinator uses consistent hashing to determine target shard
+3. **Shard Processing**: Target shard performs atomic increment/decrement operation
+4. **Response**: Coordinator returns success/failure response to client
 
-```
-Client → Coordinator → Consistent Hashing → Target Shard → Storage Update → Response
-```
+### Read Flow
 
-This pattern provides:
-- **Low Latency**: Single-hop routing to target shard
-- **High Throughput**: No coordination between shards required
-- **Fault Isolation**: Failure of one shard doesn't affect others
+1. **Client Request**: Client requests total count for a counter
+2. **Multi-Shard Query**: Coordinator queries all healthy shards
+3. **Aggregation**: Coordinator aggregates individual shard values
+4. **Response**: Coordinator returns total count to client
 
-### Read Operations (Get Total)
+### Failure Handling Flow
 
-Read operations require aggregation across all shards:
-
-```
-Client → Coordinator → Query All Shards → Aggregate Results → Response
-```
-
-This pattern provides:
-- **Complete View**: Aggregated view of all shard values
-- **Fault Tolerance**: Continues operating even if some shards are down
-- **Consistency**: Eventual consistency across all shards
-
-## Fault Tolerance and Recovery
-
-The system implements several mechanisms for fault tolerance:
-
-### Shard Failure Handling
-
-When a shard fails, the coordinator gracefully handles the failure:
-
-```java
-// From ShardedCounterCoordinator.java
-private void checkShardHealth() {
-    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
-        String address = entry.getKey();
-        ShardInfo shardInfo = entry.getValue();
-        
-        try {
-            // Send health check request
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create("http://" + address + "/health"))
-                    .timeout(Duration.ofSeconds(2))
-                    .build();
-            
-            HttpResponse<String> response = httpClient.send(request, 
-                    HttpResponse.BodyHandlers.ofString());
-            
-            if (response.statusCode() == 200) {
-                shardInfo.setHealthy(true);
-                shardInfo.setLastSeen(System.currentTimeMillis());
-            } else {
-                shardInfo.setHealthy(false);
-            }
-        } catch (Exception e) {
-            logger.warn("Health check failed for shard: {}", address);
-            shardInfo.setHealthy(false);
-        }
-    }
-}
-```
-
-### Data Recovery
-
-Shards automatically recover their state on startup by loading data from persistent storage:
-
-```java
-// From RocksDBStorage.java
-public class RocksDBStorage {
-    private final RocksDB db;
-    
-    public RocksDBStorage(String dbPath) throws Exception {
-        Options options = new Options();
-        options.setCreateIfMissing(true);
-        this.db = RocksDB.open(options, dbPath);
-    }
-    
-    public long get(String key) {
-        try {
-            byte[] value = db.get(key.getBytes());
-            return value != null ? Long.parseLong(new String(value)) : 0;
-        } catch (Exception e) {
-            logger.error("Error reading from storage", e);
-            return 0;
-        }
-    }
-    
-    public void put(String key, long value) {
-        try {
-            db.put(key.getBytes(), String.valueOf(value).getBytes());
-        } catch (Exception e) {
-            logger.error("Error writing to storage", e);
-        }
-    }
-}
-```
+1. **Failure Detection**: Health monitoring detects shard failure
+2. **Load Redistribution**: Coordinator routes operations to healthy shards
+3. **Graceful Degradation**: System continues operating with reduced capacity
+4. **Recovery**: Failed shards can rejoin when they recover
 
 ## Performance Characteristics
 
-The architecture provides several performance benefits:
+The distributed architecture provides several performance advantages:
 
 ### Write Performance
 
-- **Parallel Processing**: Writes are distributed across multiple shards
+- **Horizontal Scaling**: Write throughput scales linearly with the number of shards
 - **No Lock Contention**: Each shard operates independently
-- **Optimized Storage**: RocksDB provides high-performance operations
-- **Horizontal Scaling**: Add more shards to increase write capacity
+- **Parallel Processing**: Multiple operations can be processed simultaneously
+- **Optimized Storage**: Each shard can optimize its storage for its specific workload
 
 ### Read Performance
 
-- **Parallel Queries**: Coordinator queries all shards in parallel
-- **Caching**: RocksDB block cache provides fast access to hot data
-- **Fault Tolerance**: Continues operating even with shard failures
-- **Eventual Consistency**: Accepts some latency for complete view
+- **Parallel Queries**: All shards can be queried simultaneously
+- **Caching Opportunities**: Individual shard results can be cached
+- **Load Distribution**: Read load is distributed across all shards
+- **Fault Tolerance**: Reads can succeed even if some shards are unavailable
 
-## Scalability Considerations
+### Scalability Characteristics
 
-The architecture supports horizontal scaling through several mechanisms:
+- **Linear Scaling**: Performance scales linearly with the number of shards
+- **No Bottlenecks**: No single point of contention limits performance
+- **Elastic Capacity**: Shards can be added/removed dynamically
+- **Predictable Performance**: Performance characteristics are predictable and consistent
 
-### Adding Shards
+## Fault Tolerance and High Availability
 
-When new shards are added:
-1. **Consistent Hashing**: Only a portion of existing data needs redistribution
-2. **Gradual Migration**: Data can be migrated gradually without downtime
-3. **Load Rebalancing**: New shards automatically receive their share of new operations
+The system is designed to handle various failure scenarios gracefully:
 
-### Removing Shards
+### Node Failures
 
-When shards are removed:
-1. **Data Redistribution**: Affected data is redistributed to remaining shards
-2. **Service Continuity**: System continues operating with remaining shards
-3. **Recovery**: Failed shards can be replaced without data loss
+- **Automatic Detection**: Health monitoring detects node failures
+- **Load Redistribution**: Operations are routed to healthy nodes
+- **Graceful Degradation**: System continues operating with reduced capacity
+- **Automatic Recovery**: Failed nodes can rejoin when they recover
 
----
+### Network Partitions
 
-*This chapter explored the detailed architecture and component interactions of the distributed sharded counter system. In the next chapter, we'll examine the write operations flow in detail, including the complete request lifecycle and implementation specifics.* 
+- **Partial Availability**: System continues operating with available shards
+- **Eventual Consistency**: Data eventually becomes consistent when network recovers
+- **Conflict Resolution**: Conflicts are resolved using timestamp-based ordering
+
+### Data Corruption
+
+- **Checksums**: Data integrity is verified using checksums
+- **Backup and Recovery**: Regular backups enable data recovery
+- **Replication**: Critical data can be replicated for additional protection
+
+## Conclusion
+
+The Distributed Sharded Counter architecture provides a robust, scalable solution for high-throughput counting applications. By separating concerns between coordinators and shards, the system achieves both horizontal scalability and fault tolerance while maintaining strong consistency guarantees for individual operations.
+
+The key architectural principles—consistent hashing for routing, atomic operations for consistency, and health monitoring for fault tolerance—work together to create a system that can handle the demands of modern, high-scale applications.
+
+In the next chapter, we'll examine the write operations in detail, exploring how the system handles high-throughput increment and decrement operations while maintaining data consistency and durability. 

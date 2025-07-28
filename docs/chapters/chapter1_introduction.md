@@ -8,6 +8,9 @@ When we store a counter in a single database table, every increment operation be
 
 Let's examine a typical traditional counter implementation:
 
+<details>
+<summary><strong>Traditional Database Counter Implementation</strong></summary>
+
 ```sql
 -- Traditional database counter approach
 CREATE TABLE counters (
@@ -20,6 +23,8 @@ CREATE TABLE counters (
 UPDATE counters SET value = value + 1 WHERE id = 'global_likes';
 ```
 
+</details>
+
 This approach has several critical limitations:
 
 1. **Single Point of Failure**: If the database server fails, the entire counting system becomes unavailable.
@@ -30,6 +35,9 @@ This approach has several critical limitations:
 ## The Individual Records Approach: Another Flawed Solution
 
 Another common approach is to store each individual like or interaction as a separate row in the database, then aggregate them when needed. This might seem like a good solution at first glance, but it introduces its own set of problems.
+
+<details>
+<summary><strong>Individual Records Storage Approach</strong></summary>
 
 ```sql
 -- Alternative approach: Store individual records
@@ -48,6 +56,8 @@ INSERT INTO likes (post_id, user_id) VALUES ('post_123', 'user_456');
 -- Count likes by aggregating
 SELECT COUNT(*) FROM likes WHERE post_id = 'post_123';
 ```
+
+</details>
 
 This approach has several critical issues:
 
