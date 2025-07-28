@@ -8,11 +8,9 @@ Data replication is a critical component of the distributed sharded counter syst
 
 The system implements a primary-replica architecture where each shard has one primary node and multiple replica nodes:
 
-<details>
-<summary><strong>Primary-Replica Architecture Implementation</strong></summary>
+Primary-replica architecture provides fault tolerance:
 
 ```java
-// Primary-replica configuration
 public class ReplicationConfig {
     private final String primaryShard;
     private final List<String> replicaShards;
@@ -35,7 +33,7 @@ public class ReplicationConfig {
 }
 ```
 
-</details>
+For the complete primary-replica architecture implementation with health monitoring, see **Listing 5.1** in the appendix.
 
 This architecture provides:
 - **Fault Tolerance**: Data survives individual node failures
@@ -51,11 +49,9 @@ The system supports multiple replication strategies to balance consistency, avai
 
 Synchronous replication ensures that all replicas are updated before the operation completes:
 
-<details>
-<summary><strong>Synchronous Replication Implementation</strong></summary>
+Synchronous replication ensures all replicas are updated:
 
 ```java
-// Synchronous replication implementation
 public class SynchronousReplicationManager {
     private final ReplicationConfig config;
     private final HttpClient httpClient;
@@ -145,16 +141,13 @@ Synchronous replication provides:
 
 Asynchronous replication provides better performance by not waiting for replicas:
 
-<details>
-<summary><strong>Asynchronous Replication Implementation</strong></summary>
+Asynchronous replication provides high performance:
 
 ```java
-// Asynchronous replication implementation
 public class AsynchronousReplicationManager {
     private final ReplicationConfig config;
     private final BlockingQueue<ReplicationTask> replicationQueue;
     private final ExecutorService replicationExecutor;
-    private final AtomicLong pendingReplications = new AtomicLong(0);
     
     public AsynchronousReplicationManager(ReplicationConfig config) {
         this.config = config;
@@ -166,58 +159,11 @@ public class AsynchronousReplicationManager {
     public void replicateAsynchronously(String counterId, long delta, String operation) {
         ReplicationTask task = new ReplicationTask(counterId, delta, operation);
         replicationQueue.offer(task);
-        pendingReplications.incrementAndGet();
-    }
-    
-    private void startReplicationWorker() {
-        replicationExecutor.submit(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
-                try {
-                    ReplicationTask task = replicationQueue.take();
-                    replicateToAllReplicas(task);
-                    pendingReplications.decrementAndGet();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        });
-    }
-    
-    private void replicateToAllReplicas(ReplicationTask task) {
-        List<CompletableFuture<Void>> futures = new ArrayList<>();
-        
-        for (String replicaAddress : config.getReplicaShards()) {
-            CompletableFuture<Void> future = sendToReplicaAsync(
-                replicaAddress, task.getCounterId(), task.getDelta(), task.getOperation());
-            futures.add(future);
-        }
-        
-        // Fire and forget - don't wait for completion
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .exceptionally(throwable -> {
-                    logger.error("Replication failed for counter: " + task.getCounterId(), throwable);
-                    return null;
-                });
-    }
-    
-    private CompletableFuture<Void> sendToReplicaAsync(
-            String replicaAddress, String counterId, long delta, String operation) {
-        
-        return CompletableFuture.runAsync(() -> {
-            try {
-                // Send replication request to replica
-                ReplicationRequest request = new ReplicationRequest(counterId, delta, operation);
-                // ... HTTP request implementation
-            } catch (Exception e) {
-                logger.error("Failed to replicate to: " + replicaAddress, e);
-            }
-        });
     }
 }
 ```
 
-</details>
+For the complete asynchronous replication implementation with background processing, see **Listing 5.2** in the appendix.
 
 Asynchronous replication provides:
 - **High Performance**: Operations complete immediately
