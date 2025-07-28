@@ -11,47 +11,25 @@ The storage layer consists of two main components:
 1. **In-Memory Cache**: Fast access to counter values
 2. **RocksDB Storage**: Persistent storage for data durability
 
-<details>
-<summary>RocksDB Storage Implementation</summary>
+The RocksDB storage implementation provides the foundation for persistent data storage:
 
 ```java
-// From RocksDBStorage.java
 public class RocksDBStorage implements AutoCloseable {
-    private static final Logger logger = LoggerFactory.getLogger(RocksDBStorage.class);
-    
     private final RocksDB db;
     private final Map<String, Long> inMemoryCache;
-    private final String dbPath;
     
     public RocksDBStorage(String dbPath) throws RocksDBException {
-        this.dbPath = dbPath;
         this.inMemoryCache = new ConcurrentHashMap<>();
-        
-        // Create directory if it doesn't exist
-        File directory = new File(dbPath);
-        if (!directory.exists()) {
-            directory.mkdirs();
-        }
-        
-        // Configure RocksDB options
+        // Configure and open RocksDB
         Options options = new Options();
         options.setCreateIfMissing(true);
-        options.setMaxBackgroundJobs(4);
-        options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
-        options.setMaxWriteBufferNumber(3);
-        options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
-        
-        // Open the database
         this.db = RocksDB.open(options, dbPath);
-        
-        // Load existing data into memory
         loadDataIntoMemory();
-        
-        logger.info("RocksDB storage initialized at: {}", dbPath);
     }
 }
 ```
-</details>
+
+For the complete implementation including error handling, logging, and advanced configuration options, see **Listing 6.1** in the appendix.
 
 ## RocksDB Configuration and Setup
 
@@ -59,19 +37,16 @@ RocksDB is configured for optimal performance in the distributed counter use cas
 
 ### Database Configuration
 
-<details>
-<summary>RocksDB Configuration Options</summary>
+The RocksDB configuration is optimized for high-throughput counter operations:
 
 ```java
-// From RocksDBStorage.java
 Options options = new Options();
 options.setCreateIfMissing(true);
 options.setMaxBackgroundJobs(4);
 options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
-options.setMaxWriteBufferNumber(3);
-options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
 ```
-</details>
+
+For the complete configuration including all performance tuning options, see **Listing 6.2** in the appendix.
 
 This configuration provides:
 - **High Write Throughput**: Large write buffers for batch operations
@@ -83,31 +58,24 @@ This configuration provides:
 
 When a shard starts up, it loads all existing data from RocksDB into the in-memory cache:
 
-<details>
-<summary>Data Loading Implementation</summary>
+The data loading process ensures all existing counters are available in memory:
 
 ```java
-// From RocksDBStorage.java
 private void loadDataIntoMemory() {
     try (RocksIterator iterator = db.newIterator()) {
         iterator.seekToFirst();
-        int loadedCount = 0;
-        
         while (iterator.isValid()) {
             String key = new String(iterator.key(), StandardCharsets.UTF_8);
             String value = new String(iterator.value(), StandardCharsets.UTF_8);
             Long count = Long.parseLong(value);
-            
             inMemoryCache.put(key, count);
-            loadedCount++;
             iterator.next();
         }
-        
-        logger.info("Loaded {} counters from RocksDB into memory", loadedCount);
     }
 }
 ```
-</details>
+
+For the complete implementation with error handling and progress reporting, see **Listing 6.3** in the appendix.
 
 This ensures that:
 - **Fast Recovery**: All data is immediately available in memory
@@ -120,11 +88,9 @@ The storage layer provides atomic key-value operations for counter management:
 
 ### Increment Operations
 
-<details>
-<summary>Increment Operation Implementation</summary>
+The increment operation updates both memory and persistent storage:
 
 ```java
-// From RocksDBStorage.java
 public long increment(String counterId, long delta) throws RocksDBException {
     // Update in-memory cache
     long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
@@ -135,24 +101,19 @@ public long increment(String counterId, long delta) throws RocksDBException {
     // Persist to RocksDB
     WriteOptions writeOptions = new WriteOptions();
     writeOptions.setSync(true); // Ensure durability
+    db.put(writeOptions, counterId.getBytes(), String.valueOf(newValue).getBytes());
     
-    db.put(writeOptions, 
-           counterId.getBytes(StandardCharsets.UTF_8),
-           String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
-    
-    logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
     return newValue;
 }
 ```
-</details>
+
+For the complete implementation with comprehensive error handling and logging, see **Listing 6.4** in the appendix.
 
 ### Decrement Operations
 
-<details>
-<summary>Decrement Operation Implementation</summary>
+The decrement operation follows the same pattern as increment:
 
 ```java
-// From RocksDBStorage.java
 public long decrement(String counterId, long delta) throws RocksDBException {
     // Update in-memory cache
     long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
@@ -162,25 +123,20 @@ public long decrement(String counterId, long delta) throws RocksDBException {
     
     // Persist to RocksDB
     WriteOptions writeOptions = new WriteOptions();
-    writeOptions.setSync(true); // Ensure durability
+    writeOptions.setSync(true);
+    db.put(writeOptions, counterId.getBytes(), String.valueOf(newValue).getBytes());
     
-    db.put(writeOptions, 
-           counterId.getBytes(StandardCharsets.UTF_8),
-           String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
-    
-    logger.debug("Decremented counter {} by {}, new value: {}", counterId, delta, newValue);
     return newValue;
 }
 ```
-</details>
+
+For the complete implementation with validation and error handling, see **Listing 6.5** in the appendix.
 
 ### Read Operations
 
-<details>
-<summary>Read Operation Implementation</summary>
+The read operation prioritizes cache access for performance:
 
 ```java
-// From RocksDBStorage.java
 public long get(String counterId) throws RocksDBException {
     // First check in-memory cache
     Long cachedValue = inMemoryCache.get(counterId);
@@ -189,28 +145,26 @@ public long get(String counterId) throws RocksDBException {
     }
     
     // Fall back to RocksDB
-    byte[] value = db.get(counterId.getBytes(StandardCharsets.UTF_8));
+    byte[] value = db.get(counterId.getBytes());
     if (value != null) {
-        long dbValue = Long.parseLong(new String(value, StandardCharsets.UTF_8));
-        // Update cache for future reads
-        inMemoryCache.put(counterId, dbValue);
+        long dbValue = Long.parseLong(new String(value));
+        inMemoryCache.put(counterId, dbValue); // Update cache
         return dbValue;
     }
     
     return 0; // Default value for non-existent counters
 }
 ```
-</details>
+
+For the complete implementation with cache warming and optimization strategies, see **Listing 6.6** in the appendix.
 
 ## Batch Operations
 
 For high-throughput scenarios, the system supports batch operations:
 
-<details>
-<summary>Batch Operations Implementation</summary>
+Batch operations provide high-throughput updates:
 
 ```java
-// Conceptual batch operations
 public void batchIncrement(Map<String, Long> increments) throws RocksDBException {
     WriteBatch batch = new WriteBatch();
     
@@ -225,8 +179,7 @@ public void batchIncrement(Map<String, Long> increments) throws RocksDBException
         });
         
         // Add to batch
-        batch.put(counterId.getBytes(StandardCharsets.UTF_8),
-                 String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
+        batch.put(counterId.getBytes(), String.valueOf(newValue).getBytes());
     }
     
     // Execute batch
@@ -235,7 +188,8 @@ public void batchIncrement(Map<String, Long> increments) throws RocksDBException
     db.write(writeOptions, batch);
 }
 ```
-</details>
+
+For the complete implementation with error handling and retry logic, see **Listing 6.7** in the appendix.
 
 ## In-Memory Cache Management
 
@@ -243,11 +197,9 @@ The in-memory cache provides fast access to frequently used counter values:
 
 ### Cache Implementation
 
-<details>
-<summary>Cache Implementation</summary>
+The in-memory cache provides fast access to counter values:
 
 ```java
-// From RocksDBStorage.java
 private final Map<String, Long> inMemoryCache;
 
 public RocksDBStorage(String dbPath) throws RocksDBException {
@@ -255,7 +207,8 @@ public RocksDBStorage(String dbPath) throws RocksDBException {
     // ... other initialization
 }
 ```
-</details>
+
+For the complete cache implementation with eviction policies and monitoring, see **Listing 6.8** in the appendix.
 
 The cache provides:
 - **Thread Safety**: ConcurrentHashMap ensures thread-safe access
@@ -267,11 +220,9 @@ The cache provides:
 
 The system provides monitoring capabilities for cache performance:
 
-<details>
-<summary>Cache Monitoring Implementation</summary>
+Cache monitoring provides insights into performance:
 
 ```java
-// From RocksDBStorage.java
 public int getCacheSize() {
     return inMemoryCache.size();
 }
@@ -280,7 +231,8 @@ public Map<String, Long> getAllCounters() {
     return new HashMap<>(inMemoryCache);
 }
 ```
-</details>
+
+For the complete monitoring implementation with metrics and alerts, see **Listing 6.9** in the appendix.
 
 ## Persistence Strategies
 
@@ -290,19 +242,18 @@ The system implements several persistence strategies to balance performance and 
 
 The default strategy ensures immediate persistence:
 
-<details>
-<summary>Write-Through Strategy Implementation</summary>
+The write-through strategy ensures immediate persistence:
 
 ```java
-// From RocksDBStorage.java
 WriteOptions writeOptions = new WriteOptions();
 writeOptions.setSync(true); // Ensure durability
 
 db.put(writeOptions, 
-       counterId.getBytes(StandardCharsets.UTF_8),
-       String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
+       counterId.getBytes(),
+       String.valueOf(newValue).getBytes());
 ```
-</details>
+
+For the complete write-through implementation with error handling, see **Listing 6.10** in the appendix.
 
 This provides:
 - **Strong Durability**: Data is immediately persisted to disk
@@ -414,36 +365,31 @@ private void loadDataIntoMemory() {
 
 For large datasets, the system can implement incremental recovery:
 
-<details>
-<summary>Incremental Recovery Implementation</summary>
+Incremental recovery handles large datasets efficiently:
 
 ```java
-// Conceptual incremental recovery
 public class IncrementalRecovery {
     private final Set<String> recoveredKeys = new ConcurrentHashSet<>();
     
     public void recoverIncrementally() {
         try (RocksIterator iterator = db.newIterator()) {
             iterator.seekToFirst();
-            
             while (iterator.isValid()) {
-                String key = new String(iterator.key(), StandardCharsets.UTF_8);
-                
+                String key = new String(iterator.key());
                 if (!recoveredKeys.contains(key)) {
-                    String value = new String(iterator.value(), StandardCharsets.UTF_8);
+                    String value = new String(iterator.value());
                     Long count = Long.parseLong(value);
-                    
                     inMemoryCache.put(key, count);
                     recoveredKeys.add(key);
                 }
-                
                 iterator.next();
             }
         }
     }
 }
 ```
-</details>
+
+For the complete incremental recovery implementation with progress tracking, see **Listing 6.12** in the appendix.
 
 ## Storage Performance Optimization
 
@@ -451,53 +397,40 @@ The system implements several performance optimizations:
 
 ### Memory Management
 
-<details>
-<summary>Memory Management Configuration</summary>
+Memory management is optimized for high throughput:
 
 ```java
-// From RocksDBStorage.java
 Options options = new Options();
 options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
 options.setMaxWriteBufferNumber(3);
-options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
 ```
-</details>
+
+For the complete memory management configuration with all tuning options, see **Listing 6.13** in the appendix.
 
 ### Compression and Serialization
 
-<details>
-<summary>Compression Implementation</summary>
+Compression reduces storage requirements:
 
 ```java
-// Conceptual compression implementation
 public class CompressedStorage {
     private final CompressionType compressionType = CompressionType.LZ4_COMPRESSION;
     
     public void putCompressed(String key, long value) throws RocksDBException {
-        // Compress value before storage
         byte[] compressedValue = compress(String.valueOf(value));
-        
         WriteOptions writeOptions = new WriteOptions();
         writeOptions.setCompressionType(compressionType);
-        
         db.put(writeOptions, key.getBytes(), compressedValue);
-    }
-    
-    private byte[] compress(String data) {
-        // Implementation of compression
-        return data.getBytes(); // Simplified for example
     }
 }
 ```
-</details>
+
+For the complete compression implementation with multiple algorithms, see **Listing 6.14** in the appendix.
 
 ### Background Maintenance
 
-<details>
-<summary>Background Maintenance Implementation</summary>
+Background maintenance ensures optimal performance:
 
 ```java
-// From RocksDBStorage.java
 public void compact() throws RocksDBException {
     db.compactRange();
 }
@@ -506,7 +439,8 @@ public void flush() throws RocksDBException {
     db.flush(new FlushOptions());
 }
 ```
-</details>
+
+For the complete background maintenance implementation with scheduling and monitoring, see **Listing 6.15** in the appendix.
 
 ## Storage Monitoring and Metrics
 
@@ -514,51 +448,31 @@ The system provides comprehensive monitoring capabilities:
 
 ### Performance Metrics
 
-<details>
-<summary>Performance Metrics Implementation</summary>
+Performance metrics track system behavior:
 
 ```java
-// Conceptual metrics collection
 public class StorageMetrics {
     private final AtomicLong readCount = new AtomicLong(0);
     private final AtomicLong writeCount = new AtomicLong(0);
     private final AtomicLong cacheHitCount = new AtomicLong(0);
     private final AtomicLong cacheMissCount = new AtomicLong(0);
     
-    public void recordRead(String counterId) {
-        readCount.incrementAndGet();
-    }
-    
-    public void recordWrite(String counterId) {
-        writeCount.incrementAndGet();
-    }
-    
-    public void recordCacheHit() {
-        cacheHitCount.incrementAndGet();
-    }
-    
-    public void recordCacheMiss() {
-        cacheMissCount.incrementAndGet();
-    }
-    
     public double getCacheHitRate() {
         long hits = cacheHitCount.get();
         long misses = cacheMissCount.get();
         long total = hits + misses;
-        
         return total > 0 ? (double) hits / total : 0.0;
     }
 }
 ```
-</details>
+
+For the complete metrics implementation with comprehensive monitoring, see **Listing 6.16** in the appendix.
 
 ### Health Monitoring
 
-<details>
-<summary>Health Monitoring Implementation</summary>
+Health monitoring ensures system reliability:
 
 ```java
-// From RocksDBStorage.java
 @Override
 public void close() throws Exception {
     try {
@@ -570,12 +484,9 @@ public void close() throws Exception {
         throw e;
     }
 }
-
-public String getDbPath() {
-    return dbPath;
-}
 ```
-</details>
+
+For the complete health monitoring implementation with comprehensive checks, see **Listing 6.17** in the appendix.
 
 ---
 

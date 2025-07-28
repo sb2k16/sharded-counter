@@ -16,23 +16,14 @@ The distributed sharded counter system achieves remarkable performance improveme
 
 **Why This Matters**: Understanding these performance characteristics helps in capacity planning, cost optimization, and system design decisions. The model provides quantitative insights into when to scale and how much performance improvement to expect.
 
-<details>
-<summary>Performance Model Implementation</summary>
+The performance model provides mathematical insights into system behavior:
 
 ```java
-// Performance model for distributed sharded counter
 public class PerformanceModel {
     private final int numShards;
-    private final double inMemoryUpdateTime; // ~0.001ms
-    private final double networkLatency; // ~1-10ms
-    private final double diskWriteTime; // ~1-5ms
-    
-    public PerformanceModel(int numShards, double networkLatency, double diskWriteTime) {
-        this.numShards = numShards;
-        this.inMemoryUpdateTime = 0.001; // 1 microsecond
-        this.networkLatency = networkLatency;
-        this.diskWriteTime = diskWriteTime;
-    }
+    private final double inMemoryUpdateTime = 0.001; // 1 microsecond
+    private final double networkLatency;
+    private final double diskWriteTime;
     
     // Traditional database throughput (single-threaded)
     public double calculateTraditionalThroughput() {
@@ -42,24 +33,12 @@ public class PerformanceModel {
     
     // Distributed sharded counter throughput (parallel)
     public double calculateDistributedWriteThroughput() {
-        // Writes can be parallelized across shards
         return numShards * (1.0 / (inMemoryUpdateTime + diskWriteTime));
-    }
-    
-    // Read throughput (limited by slowest shard)
-    public double calculateDistributedReadThroughput() {
-        // Reads must aggregate from all shards
-        double slowestShardTime = inMemoryUpdateTime + networkLatency;
-        return 1.0 / (slowestShardTime * numShards);
-    }
-    
-    // Optimal shard count calculation
-    public int calculateOptimalShardCount(double targetThroughput) {
-        return (int) Math.ceil(targetThroughput / (1.0 / (inMemoryUpdateTime + diskWriteTime)));
     }
 }
 ```
-</details>
+
+For the complete performance model implementation with all calculation methods, see **Listing 7.1** in the appendix.
 
 ### Real-World Performance Characteristics
 
@@ -83,14 +62,11 @@ public class PerformanceModel {
 
 **When to Use**: This optimization is essential for any production deployment where you expect more than a few hundred requests per second. The benefits become more pronounced as the request rate increases.
 
-<details>
-<summary>Optimized HTTP Client Implementation</summary>
+Connection pooling dramatically reduces network overhead:
 
 ```java
-// Enhanced HTTP client with connection pooling
 public class OptimizedHttpClient {
     private final HttpClient httpClient;
-    private final Map<String, ConnectionPool> connectionPools;
     
     public OptimizedHttpClient() {
         this.httpClient = HttpClient.newBuilder()
@@ -98,8 +74,6 @@ public class OptimizedHttpClient {
                 .connectionPool(ConnectionPool.of(100, Duration.ofMinutes(5)))
                 .executor(Executors.newFixedThreadPool(50))
                 .build();
-        
-        this.connectionPools = new ConcurrentHashMap<>();
     }
     
     public CompletableFuture<ShardedCounterResponse> sendAsync(
@@ -107,7 +81,6 @@ public class OptimizedHttpClient {
         
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://" + shardAddress + "/sharded"))
-                .header("Content-Type", "application/json")
                 .header("Connection", "keep-alive")
                 .timeout(Duration.ofSeconds(2))
                 .POST(HttpRequest.BodyPublishers.ofString(
@@ -126,7 +99,8 @@ public class OptimizedHttpClient {
     }
 }
 ```
-</details>
+
+For the complete HTTP client implementation with advanced connection management, see **Listing 7.2** in the appendix.
 
 ### 2. Request Batching and Aggregation
 
@@ -159,45 +133,25 @@ public class OptimizedHttpClient {
 - **Retry Strategy**: Number of retries and backoff timing
 - **Durability Level**: Whether to use synchronous or asynchronous persistence
 
-<details>
-<summary>Batch Processing Implementation</summary>
+Batch processing combines multiple operations for efficiency:
 
 ```java
-// Batch processing for high-throughput scenarios with durability guarantees
 public class BatchProcessor {
     private final Map<String, List<ShardedCounterOperation>> batchQueue = new ConcurrentHashMap<>();
-    private final Map<String, CompletableFuture<Void>> pendingBatches = new ConcurrentHashMap<>();
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final int maxBatchSize = 100;
-    private final long maxBatchDelay = 10; // milliseconds
-    private final AtomicLong failedBatches = new AtomicLong(0);
     private final AtomicLong successfulBatches = new AtomicLong(0);
-    
-    // Durability configuration
-    private final boolean enableDurability = true;
-    private final int maxRetries = 3;
-    private final long retryDelayMs = 100;
+    private final AtomicLong failedBatches = new AtomicLong(0);
     
     public void submitOperation(String counterId, ShardedCounterOperation operation) {
-        // Create a future for this operation to track completion
-        CompletableFuture<Void> operationFuture = new CompletableFuture<>();
-        
         batchQueue.computeIfAbsent(counterId, k -> new ArrayList<>()).add(operation);
         
-        // Store the future for acknowledgment
-        String batchKey = counterId + "_" + System.currentTimeMillis();
-        pendingBatches.put(batchKey, operationFuture);
-        
-        // Trigger batch processing if queue is full
         List<ShardedCounterOperation> batch = batchQueue.get(counterId);
         if (batch.size() >= maxBatchSize) {
-            processBatchWithDurability(counterId, batch, batchKey);
+            processBatch(counterId, batch);
         }
     }
     
-    private void processBatchWithDurability(String counterId, List<ShardedCounterOperation> operations, String batchKey) {
-        CompletableFuture<Void> batchFuture = pendingBatches.get(batchKey);
-        
+    private void processBatch(String counterId, List<ShardedCounterOperation> operations) {
         // Calculate total delta
         long totalDelta = operations.stream()
                 .mapToLong(ShardedCounterOperation::getDelta)
@@ -206,35 +160,16 @@ public class BatchProcessor {
         // Create single batched operation
         ShardedCounterOperation batchedOp = new ShardedCounterOperation();
         batchedOp.setCounterId(counterId);
-        batchedOp.setOperationType("INCREMENT");
         batchedOp.setDelta(totalDelta);
         
-        // Send to appropriate shard with retry logic
-        String targetShard = hashRing.get(counterId);
-        
-        CompletableFuture<ShardedCounterResponse> responseFuture = 
-            sendBatchWithRetry(targetShard, batchedOp, maxRetries);
-        
-        responseFuture.thenAccept(response -> {
-            if (response.isSuccess()) {
-                // Batch successful - acknowledge all operations
-                batchFuture.complete(null);
-                successfulBatches.incrementAndGet();
-                logger.info("Batch processed successfully: {} operations, total delta: {}", 
-                    operations.size(), totalDelta);
-            } else {
-                // Batch failed - handle failure
-                handleBatchFailure(counterId, operations, batchKey, batchFuture);
-            }
-        }).exceptionally(throwable -> {
-            // Exception occurred - handle failure
-            handleBatchFailure(counterId, operations, batchKey, batchFuture);
-            return null;
-        });
-        
-        // Clear the batch from queue
+        // Send to shard
+        sendBatchToShard(counterId, batchedOp);
         batchQueue.remove(counterId);
     }
+}
+```
+
+For the complete batch processing implementation with durability guarantees and error handling, see **Listing 7.3** in the appendix.
     
     private CompletableFuture<ShardedCounterResponse> sendBatchWithRetry(
             String targetShard, ShardedCounterOperation operation, int remainingRetries) {
