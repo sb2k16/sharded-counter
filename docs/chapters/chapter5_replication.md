@@ -263,11 +263,9 @@ The replication system supports different consistency models to meet various app
 
 Strong consistency ensures that all replicas have the same view of data:
 
-<details>
-<summary><strong>Strong Consistency Implementation</strong></summary>
+Strong consistency ensures all replicas have the same view:
 
 ```java
-// Strong consistency implementation
 public class StrongConsistencyManager {
     private final ReplicationConfig config;
     private final Map<String, Long> versionNumbers = new ConcurrentHashMap<>();
