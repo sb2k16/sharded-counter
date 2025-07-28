@@ -548,11 +548,9 @@ public class AsyncWriteBehindStorage {
 - **Eviction Policies**: How to handle cache full scenarios
 - **Warming Strategies**: How to populate cache on startup
 
-<details>
-<summary>Multi-Level Caching Implementation</summary>
+Multi-level caching optimizes read performance:
 
 ```java
-// Multi-level caching for read optimization
 public class OptimizedReadCache {
     private final LoadingCache<String, Long> l1Cache; // Hot data (1 second TTL)
     private final LoadingCache<String, Long> l2Cache; // Warm data (10 second TTL)
@@ -620,7 +618,8 @@ public class OptimizedReadCache {
     }
 }
 ```
-</details>
+
+For the complete multi-level caching implementation with adaptive optimization, see **Listing 7.4** in the appendix.
 ```
 
 ## Advanced Bottleneck Identification and Resolution

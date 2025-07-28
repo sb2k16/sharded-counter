@@ -264,11 +264,9 @@ This provides:
 
 For high-performance scenarios, the system can implement write-behind:
 
-<details>
-<summary>Write-Behind Strategy Implementation</summary>
+Write-behind strategy provides high performance:
 
 ```java
-// Conceptual write-behind implementation
 public class WriteBehindStorage {
     private final Queue<WriteOperation> writeQueue = new ConcurrentLinkedQueue<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
@@ -301,17 +299,16 @@ public class WriteBehindStorage {
     }
 }
 ```
-</details>
+
+For the complete write-behind implementation with durability guarantees, see **Listing 6.18** in the appendix.
 
 ### Adaptive Persistence
 
 The system can adapt persistence strategy based on workload:
 
-<details>
-<summary>Adaptive Persistence Implementation</summary>
+Adaptive persistence adjusts strategy based on workload:
 
 ```java
-// Conceptual adaptive persistence
 public class AdaptiveStorage {
     private final AtomicLong writeCount = new AtomicLong(0);
     private final AtomicLong lastWriteTime = new AtomicLong(0);
@@ -331,7 +328,8 @@ public class AdaptiveStorage {
     }
 }
 ```
-</details>
+
+For the complete adaptive persistence implementation with workload analysis, see **Listing 6.19** in the appendix.
 
 ## Data Recovery Mechanisms
 
