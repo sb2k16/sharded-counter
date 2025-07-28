@@ -236,11 +236,9 @@ This dual-layer architecture provides:
 
 The coordinator receives the shard's response and formats it for the client:
 
-<details>
-<summary><strong>Response Handling Implementation</strong></summary>
+Response handling ensures consistent formatting:
 
 ```java
-// From ShardedCounterCoordinator.java
 private FullHttpResponse createResponse(HttpResponseStatus status, ShardedCounterResponse counterResponse) {
     try {
         String jsonResponse = objectMapper.writeValueAsString(counterResponse);
@@ -260,7 +258,7 @@ private FullHttpResponse createResponse(HttpResponseStatus status, ShardedCounte
 }
 ```
 
-</details>
+For the complete response handling implementation with comprehensive error handling, see **Listing 3.6** in the appendix.
 
 The response handling ensures:
 - **Consistent Format**: All responses follow the same JSON format
@@ -276,24 +274,14 @@ The write operation flow includes several performance optimizations:
 
 For high-throughput scenarios, the system can use asynchronous persistence:
 
-<details>
-<summary><strong>Asynchronous Persistence Implementation</strong></summary>
+Asynchronous persistence provides high performance:
 
 ```java
-// Asynchronous write-behind with durability guarantees
 public class AsyncWriteBehindStorage {
     private final Map<String, Long> inMemoryCache = new ConcurrentHashMap<>();
     private final RocksDBStorage rocksDB;
     private final BlockingQueue<WriteOperation> writeQueue = new LinkedBlockingQueue<>();
-    private final Map<String, CompletableFuture<Void>> pendingWrites = new ConcurrentHashMap<>();
     private final ExecutorService writeExecutor = Executors.newSingleThreadExecutor();
-    private final AtomicLong pendingWrites = new AtomicLong(0);
-    private final AtomicLong failedWrites = new AtomicLong(0);
-    
-    // Durability configuration
-    private final boolean enableSyncWrites = true;
-    private final int maxRetries = 3;
-    private final long flushIntervalMs = 1000; // 1 second
     
     public AsyncWriteBehindStorage(String dbPath) throws Exception {
         this.rocksDB = new RocksDBStorage(dbPath);
