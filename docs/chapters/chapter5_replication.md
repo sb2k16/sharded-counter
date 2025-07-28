@@ -175,11 +175,9 @@ Asynchronous replication provides:
 
 Semi-synchronous replication waits for a majority of replicas:
 
-<details>
-<summary><strong>Semi-Synchronous Replication Implementation</strong></summary>
+Semi-synchronous replication waits for quorum:
 
 ```java
-// Semi-synchronous replication implementation
 public class SemiSynchronousReplicationManager {
     private final ReplicationConfig config;
     private final int quorumSize;
@@ -204,50 +202,10 @@ public class SemiSynchronousReplicationManager {
         // Wait for quorum
         return waitForQuorum(replicaFutures);
     }
-    
-    private CompletableFuture<ReplicationResult> waitForQuorum(
-            List<CompletableFuture<ReplicaResponse>> replicaFutures) {
-        
-        return CompletableFuture.supplyAsync(() -> {
-            int successfulReplicas = 0;
-            int totalReplicas = replicaFutures.size();
-            
-            // Wait for responses with timeout
-            long startTime = System.currentTimeMillis();
-            long timeoutMs = 5000; // 5 second timeout
-            
-            while (System.currentTimeMillis() - startTime < timeoutMs) {
-                successfulReplicas = (int) replicaFutures.stream()
-                        .filter(f -> f.isDone())
-                        .mapToLong(f -> {
-                            try {
-                                return f.get().isSuccess() ? 1 : 0;
-                            } catch (Exception e) {
-                                return 0;
-                            }
-                        })
-                        .sum();
-                
-                if (successfulReplicas >= quorumSize) {
-                    return ReplicationResult.success();
-                }
-                
-                try {
-                    Thread.sleep(10); // Small delay before checking again
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            
-            return ReplicationResult.failure("Quorum not reached: " + 
-                successfulReplicas + "/" + totalReplicas);
-        });
-    }
 }
 ```
 
-</details>
+For the complete semi-synchronous replication implementation with quorum management, see **Listing 5.3** in the appendix.
 
 Semi-synchronous replication provides:
 - **Balanced Performance**: Better than synchronous, worse than asynchronous
