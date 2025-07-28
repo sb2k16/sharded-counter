@@ -764,8 +764,7 @@ public class PerformanceMonitor {
 - **Recovery Criteria**: When to re-include a previously failed shard
 - **Routing Weights**: How to adjust routing based on performance
 
-<details>
-<summary>Adaptive Load Balancer Implementation</summary>
+Adaptive load balancing adjusts routing based on performance:
 
 ```java
 // Adaptive load balancing based on performance metrics
@@ -853,6 +852,8 @@ public class AdaptiveLoadBalancer {
     }
 }
 ```
+
+For the complete adaptive load balancer implementation with health monitoring, see **Listing 7.5** in the appendix.
 
 ## Horizontal Scaling Strategies
 
