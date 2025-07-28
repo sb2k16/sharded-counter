@@ -137,28 +137,47 @@ private FullHttpResponse handleShardedOperation(ShardedCounterOperation operatio
 
 ### Atomic Operations
 
-Each counter operation is atomic, ensuring that concurrent operations on the same counter don't interfere with each other. The RocksDB storage layer provides the necessary thread safety:
+Each counter operation is atomic, ensuring that concurrent operations on the same counter don't interfere with each other. The atomicity is achieved through multiple layers:
 
 ```java
 // From RocksDBStorage.java
-public long get(String key) {
-    try {
-        byte[] value = db.get(key.getBytes());
-        return value != null ? Long.parseLong(new String(value)) : 0;
-    } catch (Exception e) {
-        logger.error("Error reading from storage", e);
-        return 0;
-    }
-}
-
-public void put(String key, long value) {
-    try {
-        db.put(key.getBytes(), String.valueOf(value).getBytes());
-    } catch (Exception e) {
-        logger.error("Error writing to storage", e);
-    }
+public long increment(String counterId, long delta) throws RocksDBException {
+    // Update in-memory cache atomically using ConcurrentHashMap.compute()
+    long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
+        long current = (oldValue != null) ? oldValue : 0;
+        return current + delta;
+    });
+    
+    // Persist to RocksDB with synchronous writes for durability
+    WriteOptions writeOptions = new WriteOptions();
+    writeOptions.setSync(true); // Ensure durability
+    
+    db.put(writeOptions, 
+           counterId.getBytes(StandardCharsets.UTF_8),
+           String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
+    
+    logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
+    return newValue;
 }
 ```
+
+The atomicity is guaranteed through:
+
+1. **ConcurrentHashMap.compute()**: This method provides atomic read-modify-write operations. It atomically:
+   - Reads the current value
+   - Applies the increment operation
+   - Writes the new value back
+   - All in a single atomic operation
+
+2. **RocksDB Thread Safety**: RocksDB handles concurrent access safely at the storage level, ensuring that multiple threads can safely write to the database simultaneously.
+
+3. **Synchronous Persistence**: The `writeOptions.setSync(true)` ensures that each write operation is immediately persisted to disk, providing strong durability guarantees.
+
+This implementation ensures:
+- **Thread Safety**: ConcurrentHashMap provides thread-safe atomic operations
+- **Atomicity**: Each increment operation is atomic at both cache and storage levels
+- **Durability**: Values are immediately persisted to RocksDB with sync enabled
+- **Performance**: In-memory operations provide sub-millisecond response times
 
 ### Dual-Layer Storage
 

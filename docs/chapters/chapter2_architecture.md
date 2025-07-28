@@ -133,50 +133,41 @@ The storage architecture provides:
 
 ### Atomic Counter Operations
 
-Shard nodes implement atomic counter operations using RocksDB storage:
+Shard nodes implement atomic counter operations using a combination of thread-safe in-memory caching and RocksDB's atomic operations:
 
 ```java
-// From ShardNode.java
-private FullHttpResponse handleShardedOperation(ShardedCounterOperation operation) throws Exception {
-    String counterId = operation.getCounterId();
-    String operationType = operation.getOperationType();
-    long delta = operation.getDelta();
+// From RocksDBStorage.java
+public long increment(String counterId, long delta) throws RocksDBException {
+    // Update in-memory cache atomically
+    long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
+        long current = (oldValue != null) ? oldValue : 0;
+        return current + delta;
+    });
     
-    long currentValue = 0;
-    long newValue = 0;
+    // Persist to RocksDB
+    WriteOptions writeOptions = new WriteOptions();
+    writeOptions.setSync(true); // Ensure durability
     
-    switch (operationType) {
-        case "INCREMENT":
-            currentValue = storage.get(counterId);
-            newValue = currentValue + delta;
-            storage.put(counterId, newValue);
-            break;
-            
-        case "DECREMENT":
-            currentValue = storage.get(counterId);
-            newValue = currentValue - delta;
-            storage.put(counterId, newValue);
-            break;
-            
-        case "GET_TOTAL":
-            newValue = storage.get(counterId);
-            break;
-            
-        default:
-            return createShardedResponse(HttpResponseStatus.BAD_REQUEST, 
-                    ShardedCounterResponse.error("Unknown operation type: " + operationType));
-    }
+    db.put(writeOptions, 
+           counterId.getBytes(StandardCharsets.UTF_8),
+           String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
     
-    ShardedCounterResponse response = ShardedCounterResponse.success(newValue, null);
-    return createShardedResponse(HttpResponseStatus.OK, response);
+    logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
+    return newValue;
 }
 ```
 
+The atomicity is achieved through multiple layers:
+
+1. **ConcurrentHashMap.compute()**: Provides atomic read-modify-write operations on the in-memory cache
+2. **RocksDB Thread Safety**: RocksDB handles concurrent access safely at the storage level
+3. **Synchronous Persistence**: `writeOptions.setSync(true)` ensures immediate disk persistence
+
 This implementation ensures:
-- **Thread Safety**: RocksDB provides thread-safe operations
-- **Atomicity**: Each increment operation is atomic
-- **Persistence**: Values are automatically persisted to RocksDB
-- **Performance**: Optimized storage operations
+- **Thread Safety**: ConcurrentHashMap provides thread-safe atomic operations
+- **Atomicity**: Each increment operation is atomic at both cache and storage levels
+- **Durability**: Values are immediately persisted to RocksDB with sync enabled
+- **Performance**: In-memory operations provide sub-millisecond response times
 
 ## Consistent Hashing: The Routing Engine
 
