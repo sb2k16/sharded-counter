@@ -103,24 +103,41 @@ public class OptimizedHttpClient {
 ### 2. Request Batching and Aggregation
 
 ```java
-// Batch processing for high-throughput scenarios
+// Batch processing for high-throughput scenarios with durability guarantees
 public class BatchProcessor {
     private final Map<String, List<ShardedCounterOperation>> batchQueue = new ConcurrentHashMap<>();
+    private final Map<String, CompletableFuture<Void>> pendingBatches = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
     private final int maxBatchSize = 100;
     private final long maxBatchDelay = 10; // milliseconds
+    private final AtomicLong failedBatches = new AtomicLong(0);
+    private final AtomicLong successfulBatches = new AtomicLong(0);
+    
+    // Durability configuration
+    private final boolean enableDurability = true;
+    private final int maxRetries = 3;
+    private final long retryDelayMs = 100;
     
     public void submitOperation(String counterId, ShardedCounterOperation operation) {
+        // Create a future for this operation to track completion
+        CompletableFuture<Void> operationFuture = new CompletableFuture<>();
+        
         batchQueue.computeIfAbsent(counterId, k -> new ArrayList<>()).add(operation);
+        
+        // Store the future for acknowledgment
+        String batchKey = counterId + "_" + System.currentTimeMillis();
+        pendingBatches.put(batchKey, operationFuture);
         
         // Trigger batch processing if queue is full
         List<ShardedCounterOperation> batch = batchQueue.get(counterId);
         if (batch.size() >= maxBatchSize) {
-            processBatch(counterId, batch);
+            processBatchWithDurability(counterId, batch, batchKey);
         }
     }
     
-    private void processBatch(String counterId, List<ShardedCounterOperation> operations) {
+    private void processBatchWithDurability(String counterId, List<ShardedCounterOperation> operations, String batchKey) {
+        CompletableFuture<Void> batchFuture = pendingBatches.get(batchKey);
+        
         // Calculate total delta
         long totalDelta = operations.stream()
                 .mapToLong(ShardedCounterOperation::getDelta)
@@ -132,55 +149,197 @@ public class BatchProcessor {
         batchedOp.setOperationType("INCREMENT");
         batchedOp.setDelta(totalDelta);
         
-        // Send to appropriate shard
+        // Send to appropriate shard with retry logic
         String targetShard = hashRing.get(counterId);
-        routeToShard(targetShard, batchedOp);
         
-        // Clear the batch
+        CompletableFuture<ShardedCounterResponse> responseFuture = 
+            sendBatchWithRetry(targetShard, batchedOp, maxRetries);
+        
+        responseFuture.thenAccept(response -> {
+            if (response.isSuccess()) {
+                // Batch successful - acknowledge all operations
+                batchFuture.complete(null);
+                successfulBatches.incrementAndGet();
+                logger.info("Batch processed successfully: {} operations, total delta: {}", 
+                    operations.size(), totalDelta);
+            } else {
+                // Batch failed - handle failure
+                handleBatchFailure(counterId, operations, batchKey, batchFuture);
+            }
+        }).exceptionally(throwable -> {
+            // Exception occurred - handle failure
+            handleBatchFailure(counterId, operations, batchKey, batchFuture);
+            return null;
+        });
+        
+        // Clear the batch from queue
         batchQueue.remove(counterId);
+    }
+    
+    private CompletableFuture<ShardedCounterResponse> sendBatchWithRetry(
+            String targetShard, ShardedCounterOperation operation, int remainingRetries) {
+        
+        return sendBatchToShard(targetShard, operation)
+            .exceptionally(throwable -> {
+                if (remainingRetries > 0) {
+                    logger.warn("Batch failed, retrying... ({} retries left)", remainingRetries);
+                    
+                    // Exponential backoff
+                    try {
+                        Thread.sleep(retryDelayMs * (maxRetries - remainingRetries + 1));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    
+                    return sendBatchWithRetry(targetShard, operation, remainingRetries - 1).join();
+                } else {
+                    logger.error("Batch failed after all retries", throwable);
+                    throw new RuntimeException("Batch processing failed", throwable);
+                }
+            });
+    }
+    
+    private void handleBatchFailure(String counterId, List<ShardedCounterOperation> operations, 
+                                   String batchKey, CompletableFuture<Void> batchFuture) {
+        failedBatches.incrementAndGet();
+        logger.error("Batch failed for counter: {}, operations: {}", counterId, operations.size());
+        
+        if (enableDurability) {
+            // Re-process operations individually for durability
+            processOperationsIndividually(counterId, operations);
+        }
+        
+        // Complete the future with failure
+        batchFuture.completeExceptionally(new RuntimeException("Batch processing failed"));
+        pendingBatches.remove(batchKey);
+    }
+    
+    private void processOperationsIndividually(String counterId, List<ShardedCounterOperation> operations) {
+        logger.info("Processing {} operations individually for durability", operations.size());
+        
+        List<CompletableFuture<ShardedCounterResponse>> futures = new ArrayList<>();
+        
+        for (ShardedCounterOperation operation : operations) {
+            CompletableFuture<ShardedCounterResponse> future = 
+                sendOperationIndividually(counterId, operation);
+            futures.add(future);
+        }
+        
+        // Wait for all individual operations to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .thenRun(() -> logger.info("All individual operations completed"))
+            .exceptionally(throwable -> {
+                logger.error("Some individual operations failed", throwable);
+                return null;
+            });
+    }
+    
+    private CompletableFuture<ShardedCounterResponse> sendOperationIndividually(
+            String counterId, ShardedCounterOperation operation) {
+        
+        String targetShard = hashRing.get(counterId);
+        
+        return sendBatchToShard(targetShard, operation)
+            .exceptionally(throwable -> {
+                logger.error("Individual operation failed: {}", operation, throwable);
+                // Return error response
+                return ShardedCounterResponse.error("Operation failed: " + throwable.getMessage());
+            });
     }
     
     public void startBatchScheduler() {
         scheduler.scheduleAtFixedRate(() -> {
-            // Process all pending batches
+            // Process all pending batches that have exceeded max delay
+            long currentTime = System.currentTimeMillis();
+            
             batchQueue.forEach((counterId, operations) -> {
                 if (!operations.isEmpty()) {
-                    processBatch(counterId, new ArrayList<>(operations));
+                    // Check if batch has been waiting too long
+                    String batchKey = counterId + "_" + currentTime;
+                    processBatchWithDurability(counterId, new ArrayList<>(operations), batchKey);
                 }
             });
         }, maxBatchDelay, maxBatchDelay, TimeUnit.MILLISECONDS);
     }
+    
+    // Monitoring and metrics
+    public BatchMetrics getBatchMetrics() {
+        return new BatchMetrics(
+            successfulBatches.get(),
+            failedBatches.get(),
+            batchQueue.values().stream().mapToInt(List::size).sum(),
+            pendingBatches.size()
+        );
+    }
+    
+    public static class BatchMetrics {
+        private final long successfulBatches;
+        private final long failedBatches;
+        private final int queuedOperations;
+        private final int pendingBatches;
+        
+        public BatchMetrics(long successfulBatches, long failedBatches, 
+                          int queuedOperations, int pendingBatches) {
+            this.successfulBatches = successfulBatches;
+            this.failedBatches = failedBatches;
+            this.queuedOperations = queuedOperations;
+            this.pendingBatches = pendingBatches;
+        }
+        
+        public double getSuccessRate() {
+            long total = successfulBatches + failedBatches;
+            return total > 0 ? (double) successfulBatches / total : 1.0;
+        }
+        
+        // Getters...
+    }
 }
 ```
 
-### 3. Asynchronous Processing and Write-Behind
+### 3. Asynchronous Processing with Durability Guarantees
 
 ```java
-// Asynchronous write-behind implementation
+// Asynchronous write-behind with durability guarantees
 public class AsyncWriteBehindStorage {
     private final Map<String, Long> inMemoryCache = new ConcurrentHashMap<>();
     private final RocksDBStorage rocksDB;
     private final BlockingQueue<WriteOperation> writeQueue = new LinkedBlockingQueue<>();
+    private final Map<String, CompletableFuture<Void>> pendingWrites = new ConcurrentHashMap<>();
     private final ExecutorService writeExecutor = Executors.newSingleThreadExecutor();
     private final AtomicLong pendingWrites = new AtomicLong(0);
+    private final AtomicLong failedWrites = new AtomicLong(0);
+    
+    // Durability configuration
+    private final boolean enableSyncWrites = true;
+    private final int maxRetries = 3;
+    private final long flushIntervalMs = 1000; // 1 second
     
     public AsyncWriteBehindStorage(String dbPath) throws Exception {
         this.rocksDB = new RocksDBStorage(dbPath);
         startBackgroundWriter();
+        startPeriodicFlush();
     }
     
-    public long increment(String counterId, long delta) {
+    public CompletableFuture<Long> increment(String counterId, long delta) {
+        CompletableFuture<Long> resultFuture = new CompletableFuture<>();
+        
         // Immediate in-memory update
         long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
             long current = (oldValue != null) ? oldValue : 0;
             return current + delta;
         });
         
+        // Create write operation with acknowledgment
+        WriteOperation writeOp = new WriteOperation(counterId, newValue, resultFuture);
+        
         // Queue for background persistence
-        writeQueue.offer(new WriteOperation(counterId, newValue));
+        writeQueue.offer(writeOp);
         pendingWrites.incrementAndGet();
         
-        return newValue;
+        // Return the new value immediately
+        resultFuture.complete(newValue);
+        
+        return resultFuture;
     }
     
     private void startBackgroundWriter() {
@@ -197,8 +356,8 @@ public class AsyncWriteBehindStorage {
                         // Collect more operations for batching
                         writeQueue.drainTo(batch, 99); // Up to 100 total
                         
-                        // Persist batch
-                        persistBatch(batch);
+                        // Persist batch with durability
+                        persistBatchWithDurability(batch);
                         pendingWrites.addAndGet(-batch.size());
                         batch.clear();
                     }
@@ -210,7 +369,7 @@ public class AsyncWriteBehindStorage {
         });
     }
     
-    private void persistBatch(List<WriteOperation> operations) {
+    private void persistBatchWithDurability(List<WriteOperation> operations) {
         try (WriteBatch batch = new WriteBatch()) {
             for (WriteOperation op : operations) {
                 batch.put(op.getKey().getBytes(), 
@@ -218,11 +377,116 @@ public class AsyncWriteBehindStorage {
             }
             
             WriteOptions writeOptions = new WriteOptions();
-            writeOptions.setSync(false); // Asynchronous for performance
-            rocksDB.getDb().write(writeOptions, batch);
+            writeOptions.setSync(enableSyncWrites); // Synchronous for durability
+            
+            // Retry logic for durability
+            boolean persisted = false;
+            Exception lastException = null;
+            
+            for (int attempt = 0; attempt < maxRetries && !persisted; attempt++) {
+                try {
+                    rocksDB.getDb().write(writeOptions, batch);
+                    persisted = true;
+                    
+                    // Acknowledge all operations in batch
+                    for (WriteOperation op : operations) {
+                        op.getResultFuture().complete(null);
+                    }
+                    
+                    logger.debug("Persisted batch of {} operations", operations.size());
+                    
+                } catch (Exception e) {
+                    lastException = e;
+                    logger.warn("Batch persistence failed, attempt {}/{}", attempt + 1, maxRetries, e);
+                    
+                    if (attempt < maxRetries - 1) {
+                        try {
+                            Thread.sleep(100 * (attempt + 1)); // Exponential backoff
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (!persisted) {
+                failedWrites.addAndGet(operations.size());
+                logger.error("Failed to persist batch after {} attempts", maxRetries, lastException);
+                
+                // Complete futures with failure
+                for (WriteOperation op : operations) {
+                    op.getResultFuture().completeExceptionally(lastException);
+                }
+            }
         } catch (Exception e) {
-            logger.error("Failed to persist batch", e);
+            logger.error("Error creating write batch", e);
+            failedWrites.addAndGet(operations.size());
+            
+            // Complete futures with failure
+            for (WriteOperation op : operations) {
+                op.getResultFuture().completeExceptionally(e);
+            }
         }
+    }
+    
+    private void startPeriodicFlush() {
+        ScheduledExecutorService flushExecutor = Executors.newSingleThreadScheduledExecutor();
+        flushExecutor.scheduleAtFixedRate(() -> {
+            try {
+                rocksDB.flush();
+                logger.debug("Periodic flush completed");
+            } catch (Exception e) {
+                logger.error("Periodic flush failed", e);
+            }
+        }, flushIntervalMs, flushIntervalMs, TimeUnit.MILLISECONDS);
+    }
+    
+    // Graceful shutdown with durability
+    public CompletableFuture<Void> shutdown() {
+        CompletableFuture<Void> shutdownFuture = new CompletableFuture<>();
+        
+        writeExecutor.submit(() -> {
+            try {
+                // Process remaining operations
+                List<WriteOperation> remainingOps = new ArrayList<>();
+                writeQueue.drainTo(remainingOps);
+                
+                if (!remainingOps.isEmpty()) {
+                    logger.info("Processing {} remaining operations during shutdown", remainingOps.size());
+                    persistBatchWithDurability(remainingOps);
+                }
+                
+                // Final flush
+                rocksDB.flush();
+                
+                writeExecutor.shutdown();
+                shutdownFuture.complete(null);
+                
+            } catch (Exception e) {
+                logger.error("Error during shutdown", e);
+                shutdownFuture.completeExceptionally(e);
+            }
+        });
+        
+        return shutdownFuture;
+    }
+    
+    private static class WriteOperation {
+        private final String key;
+        private final long value;
+        private final CompletableFuture<Void> resultFuture;
+        
+        public WriteOperation(String key, long value, CompletableFuture<Void> resultFuture) {
+            this.key = key;
+            this.value = value;
+            this.resultFuture = resultFuture;
+        }
+        
+        // Getters...
+        public String getKey() { return key; }
+        public long getValue() { return value; }
+        public CompletableFuture<Void> getResultFuture() { return resultFuture; }
     }
 }
 ```
@@ -1034,6 +1298,191 @@ public class ApplicationOptimizer {
         // Cache optimization
         System.setProperty("jdk.httpclient.keepalive.timeout", "300");
         System.setProperty("jdk.httpclient.connectionPoolSize", "100");
+    }
+}
+```
+
+## Data Loss Risk Mitigation Strategies
+
+### 1. **Acknowledgment Mechanisms**
+
+```java
+// Acknowledgment-based batching with durability
+public class AcknowledgedBatchProcessor {
+    private final Map<String, BatchAcknowledgment> pendingAcks = new ConcurrentHashMap<>();
+    private final AtomicLong unacknowledgedOperations = new AtomicLong(0);
+    
+    public CompletableFuture<Void> submitOperationWithAck(String counterId, 
+            ShardedCounterOperation operation) {
+        
+        CompletableFuture<Void> ackFuture = new CompletableFuture<>();
+        String operationId = generateOperationId();
+        
+        // Store acknowledgment future
+        BatchAcknowledgment ack = new BatchAcknowledgment(operationId, operation, ackFuture);
+        pendingAcks.put(operationId, ack);
+        unacknowledgedOperations.incrementAndGet();
+        
+        // Submit to batch
+        submitOperation(counterId, operation);
+        
+        return ackFuture;
+    }
+    
+    private void acknowledgeBatch(String batchId, List<String> operationIds) {
+        for (String operationId : operationIds) {
+            BatchAcknowledgment ack = pendingAcks.remove(operationId);
+            if (ack != null) {
+                ack.getFuture().complete(null);
+                unacknowledgedOperations.decrementAndGet();
+            }
+        }
+    }
+    
+    private void failBatch(String batchId, List<String> operationIds, Exception error) {
+        for (String operationId : operationIds) {
+            BatchAcknowledgment ack = pendingAcks.remove(operationId);
+            if (ack != null) {
+                ack.getFuture().completeExceptionally(error);
+                unacknowledgedOperations.decrementAndGet();
+            }
+        }
+    }
+    
+    private static class BatchAcknowledgment {
+        private final String operationId;
+        private final ShardedCounterOperation operation;
+        private final CompletableFuture<Void> future;
+        
+        public BatchAcknowledgment(String operationId, ShardedCounterOperation operation, 
+                                 CompletableFuture<Void> future) {
+            this.operationId = operationId;
+            this.operation = operation;
+            this.future = future;
+        }
+        
+        // Getters...
+    }
+}
+```
+
+### 2. **Failure Recovery and Replay**
+
+```java
+// Failure recovery with operation replay
+public class BatchRecoveryManager {
+    private final Map<String, List<ShardedCounterOperation>> failedBatches = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService recoveryExecutor = Executors.newScheduledThreadPool(1);
+    
+    public void recordBatchFailure(String batchId, List<ShardedCounterOperation> operations) {
+        failedBatches.put(batchId, new ArrayList<>(operations));
+        logger.error("Batch {} failed, {} operations queued for recovery", batchId, operations.size());
+        
+        // Schedule recovery attempt
+        scheduleRecovery(batchId, operations);
+    }
+    
+    private void scheduleRecovery(String batchId, List<ShardedCounterOperation> operations) {
+        recoveryExecutor.schedule(() -> {
+            try {
+                recoverBatch(batchId, operations);
+            } catch (Exception e) {
+                logger.error("Recovery failed for batch {}", batchId, e);
+                // Could implement exponential backoff or alerting here
+            }
+        }, 1, TimeUnit.SECONDS);
+    }
+    
+    private void recoverBatch(String batchId, List<ShardedCounterOperation> operations) {
+        logger.info("Attempting to recover batch {} with {} operations", batchId, operations.size());
+        
+        // Process operations individually for maximum durability
+        List<CompletableFuture<ShardedCounterResponse>> futures = new ArrayList<>();
+        
+        for (ShardedCounterOperation operation : operations) {
+            CompletableFuture<ShardedCounterResponse> future = 
+                sendOperationWithRetry(operation, 5); // More retries for recovery
+            futures.add(future);
+        }
+        
+        // Wait for all operations to complete
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+            .thenRun(() -> {
+                failedBatches.remove(batchId);
+                logger.info("Successfully recovered batch {}", batchId);
+            })
+            .exceptionally(throwable -> {
+                logger.error("Recovery failed for batch {}", batchId, throwable);
+                return null;
+            });
+    }
+}
+```
+
+### 3. **Monitoring and Alerting**
+
+```java
+// Comprehensive monitoring for data loss prevention
+public class BatchMonitoring {
+    private final AtomicLong totalOperations = new AtomicLong(0);
+    private final AtomicLong acknowledgedOperations = new AtomicLong(0);
+    private final AtomicLong failedOperations = new AtomicLong(0);
+    private final AtomicLong unacknowledgedOperations = new AtomicLong(0);
+    
+    public void recordOperationSubmitted() {
+        totalOperations.incrementAndGet();
+        unacknowledgedOperations.incrementAndGet();
+    }
+    
+    public void recordOperationAcknowledged() {
+        acknowledgedOperations.incrementAndGet();
+        unacknowledgedOperations.decrementAndGet();
+    }
+    
+    public void recordOperationFailed() {
+        failedOperations.incrementAndGet();
+        unacknowledgedOperations.decrementAndGet();
+    }
+    
+    public BatchHealthMetrics getHealthMetrics() {
+        long total = totalOperations.get();
+        long acked = acknowledgedOperations.get();
+        long failed = failedOperations.get();
+        long unacked = unacknowledgedOperations.get();
+        
+        double successRate = total > 0 ? (double) acked / total : 1.0;
+        double failureRate = total > 0 ? (double) failed / total : 0.0;
+        
+        return new BatchHealthMetrics(total, acked, failed, unacked, successRate, failureRate);
+    }
+    
+    public boolean isHealthy() {
+        BatchHealthMetrics metrics = getHealthMetrics();
+        
+        // Alert if failure rate is too high
+        if (metrics.getFailureRate() > 0.01) { // > 1% failure rate
+            logger.warn("High batch failure rate: {}%", metrics.getFailureRate() * 100);
+            return false;
+        }
+        
+        // Alert if too many unacknowledged operations
+        if (metrics.getUnacknowledgedOperations() > 1000) {
+            logger.warn("Too many unacknowledged operations: {}", metrics.getUnacknowledgedOperations());
+            return false;
+        }
+        
+        return true;
+    }
+    
+    public static class BatchHealthMetrics {
+        private final long totalOperations;
+        private final long acknowledgedOperations;
+        private final long failedOperations;
+        private final long unacknowledgedOperations;
+        private final double successRate;
+        private final double failureRate;
+        
+        // Constructor and getters...
     }
 }
 ```
