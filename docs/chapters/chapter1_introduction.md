@@ -8,11 +8,9 @@ When we store a counter in a single database table, every increment operation be
 
 Let's examine a typical traditional counter implementation:
 
-<details>
-<summary><strong>Traditional Database Counter Implementation</strong></summary>
+Traditional database counters use a simple table structure:
 
 ```sql
--- Traditional database counter approach
 CREATE TABLE counters (
     id VARCHAR(255) PRIMARY KEY,
     value BIGINT NOT NULL DEFAULT 0,
@@ -23,7 +21,7 @@ CREATE TABLE counters (
 UPDATE counters SET value = value + 1 WHERE id = 'global_likes';
 ```
 
-</details>
+For complete database schema and optimization strategies, see **Listing 1.1** in the appendix.
 
 This approach has several critical limitations:
 
@@ -36,18 +34,15 @@ This approach has several critical limitations:
 
 Another common approach is to store each individual like or interaction as a separate row in the database, then aggregate them when needed. This might seem like a good solution at first glance, but it introduces its own set of problems.
 
-<details>
-<summary><strong>Individual Records Storage Approach</strong></summary>
+Individual records approach stores each interaction separately:
 
 ```sql
--- Alternative approach: Store individual records
 CREATE TABLE likes (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     post_id VARCHAR(255) NOT NULL,
     user_id VARCHAR(255) NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_post_id (post_id),
-    INDEX idx_created_at (created_at)
+    INDEX idx_post_id (post_id)
 );
 
 -- Insert individual like records
@@ -57,7 +52,7 @@ INSERT INTO likes (post_id, user_id) VALUES ('post_123', 'user_456');
 SELECT COUNT(*) FROM likes WHERE post_id = 'post_123';
 ```
 
-</details>
+For complete individual records implementation with optimization strategies, see **Listing 1.2** in the appendix.
 
 This approach has several critical issues:
 

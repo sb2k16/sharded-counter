@@ -27,11 +27,9 @@ Coordinator nodes serve as the entry point for all client requests and handle th
 
 The coordinator uses consistent hashing to deterministically route counter operations to specific shards. This ensures that the same counter ID always maps to the same shard, providing predictable behavior and enabling efficient caching.
 
-<details>
-<summary><strong>ShardedCounterCoordinator Implementation</strong></summary>
+The coordinator manages routing and aggregation:
 
 ```java
-// From ShardedCounterCoordinator.java
 public class ShardedCounterCoordinator {
     private final ConsistentHash<String> hashRing;
     private final List<String> shardAddresses;
@@ -56,7 +54,7 @@ public class ShardedCounterCoordinator {
 }
 ```
 
-</details>
+For the complete coordinator implementation with error handling and health monitoring, see **Listing 2.1** in the appendix.
 
 The consistent hashing implementation ensures that:
 - **Deterministic Routing**: The same counter ID always routes to the same shard
@@ -68,11 +66,9 @@ The consistent hashing implementation ensures that:
 
 For read operations, the coordinator must query all shards and aggregate their individual values to provide the total count. This is implemented in the `handleGetTotal` method:
 
-<details>
-<summary><strong>Read Operation Aggregation Implementation</strong></summary>
+Read operations aggregate values from all shards:
 
 ```java
-// From ShardedCounterCoordinator.java
 private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation) {
     Map<String, Long> shardValues = new HashMap<>();
     long totalValue = 0;
@@ -125,11 +121,9 @@ Shard nodes are responsible for storing and processing counter values. They impl
 
 Shard nodes implement atomic counter operations using RocksDB storage. The atomicity is achieved through a combination of in-memory operations and persistent storage:
 
-<details>
-<summary><strong>Atomic Counter Operations Implementation</strong></summary>
+Atomic operations ensure data consistency:
 
 ```java
-// From RocksDBStorage.java (referenced in Chapter 2 for atomicity)
 public long increment(String counterId, long delta) throws RocksDBException {
     // Update in-memory cache atomically
     long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
@@ -145,12 +139,11 @@ public long increment(String counterId, long delta) throws RocksDBException {
            counterId.getBytes(StandardCharsets.UTF_8),
            String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
 
-    logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
     return newValue;
 }
 ```
 
-</details>
+For the complete atomic operations implementation with error handling, see **Listing 2.2** in the appendix.
 
 The atomicity is guaranteed through several mechanisms:
 
@@ -163,11 +156,9 @@ The atomicity is guaranteed through several mechanisms:
 
 Shard nodes implement health monitoring to detect failures and enable automatic failover:
 
-<details>
-<summary><strong>Health Monitoring Implementation</strong></summary>
+Health monitoring detects failing shards:
 
 ```java
-// From ShardNode.java
 private void checkShardHealth() {
     for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
         String address = entry.getKey();
@@ -187,7 +178,7 @@ private void checkShardHealth() {
 }
 ```
 
-</details>
+For the complete health monitoring implementation with advanced failure detection, see **Listing 2.3** in the appendix.
 
 This health monitoring system provides:
 - **Proactive Failure Detection**: Identifies failing shards before they impact operations
@@ -201,11 +192,9 @@ Consistent hashing is the core algorithm that enables deterministic routing and 
 
 ### Hash Ring Implementation
 
-<details>
-<summary><strong>Consistent Hashing Implementation</strong></summary>
+Consistent hashing provides deterministic routing:
 
 ```java
-// From ConsistentHash.java
 public class ConsistentHash<T> {
     private final HashFunction hashFunction;
     private final int numberOfReplicas;

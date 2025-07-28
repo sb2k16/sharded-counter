@@ -8,11 +8,9 @@ Write operations in the distributed sharded counter system follow a well-defined
 
 The coordinator receives HTTP POST requests containing counter operations. The request processing is handled by the `ShardedCounterHandler`:
 
-<details>
-<summary><strong>HTTP Request Processing Implementation</strong></summary>
+HTTP requests are processed through the coordinator:
 
 ```java
-// From ShardedCounterCoordinator.java
 @Override
 protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
     FullHttpResponse response;
@@ -36,15 +34,13 @@ protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) 
 }
 ```
 
-</details>
+For the complete HTTP request processing implementation with error handling, see **Listing 3.1** in the appendix.
 
 The POST request handler parses the operation and routes it to the appropriate handler:
 
-<details>
-<summary><strong>Operation Routing Implementation</strong></summary>
+Operations are routed based on their type:
 
 ```java
-// From ShardedCounterCoordinator.java
 private FullHttpResponse handlePost(FullHttpRequest request) throws Exception {
     String content = request.content().toString(CharsetUtil.UTF_8);
     ShardedCounterOperation operation = objectMapper.readValue(content, ShardedCounterOperation.class);
@@ -65,17 +61,15 @@ private FullHttpResponse handlePost(FullHttpRequest request) throws Exception {
 }
 ```
 
-</details>
+For the complete operation routing implementation with validation, see **Listing 3.2** in the appendix.
 
 ### Consistent Hashing for Shard Selection
 
 Once the operation is parsed, the coordinator uses consistent hashing to determine which shard should handle the operation:
 
-<details>
-<summary><strong>Consistent Hashing Routing Implementation</strong></summary>
+Consistent hashing determines the target shard:
 
 ```java
-// From ShardedCounterCoordinator.java
 private ShardedCounterResponse handleIncrement(ShardedCounterOperation operation) {
     String counterId = operation.getCounterId();
     long delta = operation.getDelta();
@@ -102,7 +96,7 @@ private ShardedCounterResponse handleIncrement(ShardedCounterOperation operation
 }
 ```
 
-</details>
+For the complete consistent hashing routing implementation with load balancing, see **Listing 3.3** in the appendix.
 
 The consistent hashing ensures that:
 - **Deterministic Routing**: The same counter ID always routes to the same shard
@@ -113,11 +107,9 @@ The consistent hashing ensures that:
 
 The target shard receives the operation and processes it atomically. The shard implements the operation in its `ShardNodeHandler`:
 
-<details>
-<summary><strong>Shard Operation Processing Implementation</strong></summary>
+Shard nodes process operations locally:
 
 ```java
-// From ShardNode.java
 private FullHttpResponse handleShardedOperation(ShardedCounterOperation operation) throws Exception {
     ShardedCounterResponse response;
     
@@ -146,7 +138,7 @@ private FullHttpResponse handleShardedOperation(ShardedCounterOperation operatio
 }
 ```
 
-</details>
+For the complete shard operation processing implementation with error handling, see **Listing 3.4** in the appendix.
 
 The shard processing provides:
 - **Atomic Operations**: Each increment/decrement is atomic
@@ -158,11 +150,9 @@ The shard processing provides:
 
 The atomicity of counter operations is critical for data consistency. The implementation uses multiple layers to ensure atomicity:
 
-<details>
-<summary><strong>Atomic Counter Operations Implementation</strong></summary>
+Atomic operations ensure data consistency:
 
 ```java
-// From RocksDBStorage.java (referenced in Chapter 3 for atomicity)
 public long increment(String counterId, long delta) throws RocksDBException {
     // Update in-memory cache atomically using ConcurrentHashMap.compute()
     long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
@@ -178,12 +168,11 @@ public long increment(String counterId, long delta) throws RocksDBException {
            counterId.getBytes(StandardCharsets.UTF_8),
            String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
 
-    logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
     return newValue;
 }
 ```
 
-</details>
+For the complete atomic operations implementation with comprehensive error handling, see **Listing 3.5** in the appendix.
 
 The atomicity is guaranteed through several mechanisms:
 
@@ -196,11 +185,9 @@ The atomicity is guaranteed through several mechanisms:
 
 The storage layer uses a dual-layer approach combining in-memory caching with persistent storage:
 
-<details>
-<summary><strong>Dual-Layer Storage Implementation</strong></summary>
+Dual-layer storage combines memory and persistence:
 
 ```java
-// From RocksDBStorage.java
 public class RocksDBStorage implements AutoCloseable {
     private static final Logger logger = LoggerFactory.getLogger(RocksDBStorage.class);
 

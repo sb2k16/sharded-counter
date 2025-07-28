@@ -8,11 +8,9 @@ Read operations in the distributed sharded counter system follow a distinct life
 
 The coordinator implements a multi-shard query strategy that queries all available shards and aggregates their individual values:
 
-<details>
-<summary><strong>Multi-Shard Query Implementation</strong></summary>
+Multi-shard queries aggregate data from all shards:
 
 ```java
-// From ShardedCounterCoordinator.java
 private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation) {
     Map<String, Long> shardValues = new HashMap<>();
     long totalValue = 0;
@@ -49,7 +47,7 @@ private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation)
 }
 ```
 
-</details>
+For the complete multi-shard query implementation with fault tolerance, see **Listing 4.1** in the appendix.
 
 This multi-shard approach provides several benefits:
 - **Complete View**: Aggregates data from all shards to provide the total count
@@ -61,11 +59,9 @@ This multi-shard approach provides several benefits:
 
 Each shard is queried independently using HTTP requests:
 
-<details>
-<summary><strong>Individual Shard Query Implementation</strong></summary>
+Individual shard queries use HTTP requests:
 
 ```java
-// From ShardedCounterCoordinator.java
 private ShardedCounterResponse queryShard(String shardAddress, String counterId) {
     try {
         // Create query operation
@@ -100,7 +96,7 @@ private ShardedCounterResponse queryShard(String shardAddress, String counterId)
 }
 ```
 
-</details>
+For the complete individual shard query implementation with retry logic, see **Listing 4.2** in the appendix.
 
 The individual shard querying provides:
 - **Timeout Handling**: Configurable timeouts prevent hanging requests
