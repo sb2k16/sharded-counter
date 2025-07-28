@@ -658,11 +658,9 @@ public class OptimizedReadCache {
 - **Capacity Planning**: Use historical data for capacity planning
 - **Debugging**: Detailed metrics help debug performance issues
 
-<details>
-<summary>Performance Monitoring Implementation</summary>
+Performance monitoring provides real-time visibility:
 
 ```java
-// Comprehensive performance monitoring
 public class PerformanceMonitor {
     private final MeterRegistry meterRegistry;
     private final Map<String, Timer> operationTimers = new ConcurrentHashMap<>();
