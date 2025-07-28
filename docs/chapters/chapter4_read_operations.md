@@ -209,11 +209,9 @@ Weighted aggregation provides:
 
 For high-consistency requirements, consensus-based aggregation can be used:
 
-<details>
-<summary><strong>Consensus-Based Aggregation Implementation</strong></summary>
+Consensus-based aggregation requires majority agreement:
 
 ```java
-// Consensus-based aggregation requiring majority agreement
 public class ConsensusAggregator implements AggregationAlgorithm {
     private final double consensusThreshold; // e.g., 0.5 for majority
     
@@ -266,7 +264,7 @@ public class ConsensusAggregator implements AggregationAlgorithm {
 }
 ```
 
-</details>
+For the complete consensus-based aggregation implementation with advanced error detection, see **Listing 4.5** in the appendix.
 
 Consensus-based aggregation provides:
 - **High Consistency**: Requires agreement among multiple shards
@@ -282,11 +280,9 @@ The distributed sharded counter system operates under an eventual consistency mo
 
 The system supports different consistency levels for read operations:
 
-<details>
-<summary><strong>Consistency Level Implementation</strong></summary>
+Consistency levels provide different guarantees:
 
 ```java
-// Consistency level configuration
 public enum ConsistencyLevel {
     EVENTUAL,    // Return immediately with available data
     QUORUM,      // Wait for majority of shards
@@ -301,7 +297,6 @@ public class ConsistencyAwareAggregator {
         this.consistencyLevel = consistencyLevel;
         this.totalShards = totalShards;
     }
-    
     public AggregationResult aggregate(Map<String, ShardResponse> shardResponses) {
         int successfulShards = (int) shardResponses.values().stream()
                 .filter(ShardResponse::isSuccess)
@@ -355,11 +350,9 @@ The read operation system implements comprehensive fault tolerance mechanisms:
 
 When individual shards fail, the system continues operating:
 
-<details>
-<summary><strong>Shard Failure Handling Implementation</strong></summary>
+Shard failure handling ensures fault tolerance:
 
 ```java
-// Shard failure handling in read operations
 public class FaultTolerantReadHandler {
     private final Map<String, ShardHealth> shardHealth;
     private final int maxRetries;
@@ -394,17 +387,15 @@ public class FaultTolerantReadHandler {
 }
 ```
 
-</details>
+For the complete shard failure handling implementation with health monitoring, see **Listing 4.6** in the appendix.
 
 ### Timeout and Retry Logic
 
 The system implements configurable timeout and retry mechanisms:
 
-<details>
-<summary><strong>Timeout and Retry Implementation</strong></summary>
+Timeout and retry logic handles failures gracefully:
 
 ```java
-// Timeout and retry configuration
 public class ReadOperationConfig {
     private final Duration shardTimeout;
     private final Duration totalTimeout;
@@ -437,7 +428,7 @@ public class ReadOperationConfig {
 }
 ```
 
-</details>
+For the complete timeout and retry implementation with configurable strategies, see **Listing 4.7** in the appendix.
 
 ## Performance Trade-offs
 

@@ -297,11 +297,9 @@ public class AsyncWriteBehindStorage {
 
 HTTP connections to shards are pooled for better performance:
 
-<details>
-<summary><strong>Connection Pooling Implementation</strong></summary>
+Connection pooling improves HTTP performance:
 
 ```java
-// HTTP Connection Pool for high-performance HTTP communication
 public class HttpConnectionPool {
     private final Map<String, HttpClient> clientPools = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> connectionCounts = new ConcurrentHashMap<>();
@@ -320,17 +318,15 @@ public class HttpConnectionPool {
 }
 ```
 
-</details>
+For the complete connection pooling implementation with advanced configuration, see **Listing 3.7** in the appendix.
 
 ## Error Handling and Retry Logic
 
 The system implements comprehensive error handling and retry logic:
 
-<details>
-<summary><strong>Error Handling and Retry Implementation</strong></summary>
+Error handling with retry logic ensures reliability:
 
 ```java
-// Comprehensive error handling with retry logic
 public class WriteOperationRetryHandler {
     private final int maxRetries;
     private final long retryDelayMs;
@@ -352,30 +348,10 @@ public class WriteOperationRetryHandler {
             return response;
         });
     }
-    
-    private CompletableFuture<ShardedCounterResponse> retryOperation(
-            Supplier<CompletableFuture<ShardedCounterResponse>> operation, 
-            int attempt) {
-        
-        if (attempt > maxRetries) {
-            return CompletableFuture.failedFuture(
-                new RuntimeException("Max retries exceeded"));
-        }
-        
-        return CompletableFuture.delayedExecutor(
-            backoff.getDelay(attempt), TimeUnit.MILLISECONDS)
-            .execute(() -> operation.get())
-            .handle((response, throwable) -> {
-                if (throwable != null) {
-                    return retryOperation(operation, attempt + 1);
-                }
-                return response;
-            });
-    }
 }
 ```
 
-</details>
+For the complete error handling implementation with exponential backoff, see **Listing 3.8** in the appendix.
 
 ## Consistency and Durability Guarantees
 
