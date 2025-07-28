@@ -112,11 +112,9 @@ The system supports multiple aggregation algorithms depending on the consistency
 
 The default aggregation algorithm simply sums the values from all available shards:
 
-<details>
-<summary><strong>Simple Sum Aggregation Implementation</strong></summary>
+Simple sum aggregation combines all shard values:
 
 ```java
-// Simple sum aggregation
 public class SimpleSumAggregator implements AggregationAlgorithm {
     @Override
     public AggregationResult aggregate(Map<String, ShardResponse> shardResponses) {
@@ -145,7 +143,7 @@ public class SimpleSumAggregator implements AggregationAlgorithm {
 }
 ```
 
-</details>
+For the complete simple sum aggregation implementation with error handling, see **Listing 4.3** in the appendix.
 
 This simple aggregation provides:
 - **Fast Response**: Minimal processing overhead
@@ -157,11 +155,9 @@ This simple aggregation provides:
 
 For systems with varying shard reliability, weighted aggregation can be used:
 
-<details>
-<summary><strong>Weighted Aggregation Implementation</strong></summary>
+Weighted aggregation considers shard reliability:
 
 ```java
-// Weighted aggregation based on shard reliability
 public class WeightedAggregator implements AggregationAlgorithm {
     private final Map<String, Double> shardWeights;
     
@@ -201,7 +197,7 @@ public class WeightedAggregator implements AggregationAlgorithm {
 }
 ```
 
-</details>
+For the complete weighted aggregation implementation with dynamic weight adjustment, see **Listing 4.4** in the appendix.
 
 Weighted aggregation provides:
 - **Reliability-Based Weighting**: More reliable shards have higher weight
