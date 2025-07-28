@@ -30,15 +30,25 @@ The coordinator uses consistent hashing to deterministically route counter opera
 ```java
 // From ShardedCounterCoordinator.java
 public class ShardedCounterCoordinator {
-    private final ConsistentHash hashRing;
+    private final ConsistentHash<String> hashRing;
     private final List<String> shardAddresses;
+    private final Map<String, ShardInfo> shards;
     
-    public ShardedCounterResponse handleRequest(ShardedCounterOperation operation) {
-        // Determine which shard should handle this counter
-        String targetShard = hashRing.get(operation.getCounterId());
+    public ShardedCounterCoordinator(int port, List<String> shardAddresses) {
+        this.shardAddresses = new ArrayList<>(shardAddresses);
+        this.shards = new ConcurrentHashMap<>();
         
-        // Route the operation to the appropriate shard
-        return routeToShard(targetShard, operation);
+        // Initialize shards
+        for (String address : shardAddresses) {
+            shards.put(address, new ShardInfo(address));
+        }
+        
+        // Initialize consistent hash ring for routing writes
+        this.hashRing = new ConsistentHash<>(
+                new ConsistentHash.FNVHashFunction(), 
+                150, // Number of virtual nodes per shard
+                shards.keySet()
+        );
     }
 }
 ```
@@ -46,34 +56,48 @@ public class ShardedCounterCoordinator {
 The consistent hashing implementation ensures that:
 - **Deterministic Routing**: The same counter ID always routes to the same shard
 - **Load Distribution**: Operations are evenly distributed across available shards
-- **Minimal Rebalancing**: When shards are added or removed, only a small portion of data needs to be redistributed
+- **Minimal Rebalancing**: Only O(1/n) of data moves when nodes change
+- **Virtual Nodes**: Improved load distribution through virtual node replication
 
 ### Operation Aggregation for Reads
 
-For read operations, the coordinator must query all shards and aggregate their individual values to provide the total count. This is implemented in the `getTotalValue` method:
+For read operations, the coordinator must query all shards and aggregate their individual values to provide the total count. This is implemented in the `handleGetTotal` method:
 
 ```java
 // From ShardedCounterCoordinator.java
-public ShardedCounterResponse getTotalValue(String counterId) {
+private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation) {
     Map<String, Long> shardValues = new HashMap<>();
     long totalValue = 0;
+    int successfulResponses = 0;
     
     // Query all shards for their individual values
-    for (String shardAddress : shardAddresses) {
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String shardAddress = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
+        
+        if (!shardInfo.isHealthy()) {
+            logger.warn("Skipping unhealthy shard: {}", shardAddress);
+            continue;
+        }
+        
         try {
-            ShardedCounterResponse response = queryShard(shardAddress, counterId);
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
             if (response.isSuccess()) {
                 long shardValue = response.getShardValue();
                 shardValues.put(shardAddress, shardValue);
                 totalValue += shardValue;
+                successfulResponses++;
             }
         } catch (Exception e) {
-            // Handle shard failure gracefully
             logger.error("Failed to query shard: " + shardAddress, e);
         }
     }
     
-    return new ShardedCounterResponse(true, totalValue, shardValues);
+    if (successfulResponses == 0) {
+        return ShardedCounterResponse.error("No healthy shards available");
+    }
+    
+    return ShardedCounterResponse.success(totalValue, shardValues);
 }
 ```
 
@@ -90,46 +114,69 @@ Each shard implements a dual-layer storage approach combining in-memory caching 
 ```java
 // From ShardNode.java
 public class ShardNode {
-    private final Map<String, Long> inMemoryCache;
-    private final RocksDBStorage persistentStorage;
+    private final int port;
+    private final RocksDBStorage storage;
+    private final ObjectMapper objectMapper;
     
-    public ShardNode() {
-        this.inMemoryCache = new ConcurrentHashMap<>();
-        this.persistentStorage = new RocksDBStorage();
-        loadDataFromPersistentStorage();
+    public ShardNode(int port, String dbPath) throws Exception {
+        this.port = port;
+        this.storage = new RocksDBStorage(dbPath);
+        this.objectMapper = new ObjectMapper();
     }
 }
 ```
 
 The storage architecture provides:
-- **Fast Access**: In-memory cache for hot data
-- **Durability**: RocksDB for persistent storage
+- **Fast Access**: RocksDB for high-performance key-value storage
+- **Durability**: Persistent storage for data reliability
 - **Recovery**: Automatic data reconstruction on startup
 
 ### Atomic Counter Operations
 
-Shard nodes implement atomic counter operations using thread-safe data structures:
+Shard nodes implement atomic counter operations using RocksDB storage:
 
 ```java
 // From ShardNode.java
-public long increment(String counterId, long delta) {
-    return inMemoryCache.compute(counterId, (key, oldValue) -> {
-        long current = (oldValue != null) ? oldValue : 0;
-        long newValue = current + delta;
-        
-        // Persist to RocksDB asynchronously
-        persistentStorage.put(counterId, String.valueOf(newValue));
-        
-        return newValue;
-    });
+private FullHttpResponse handleShardedOperation(ShardedCounterOperation operation) throws Exception {
+    String counterId = operation.getCounterId();
+    String operationType = operation.getOperationType();
+    long delta = operation.getDelta();
+    
+    long currentValue = 0;
+    long newValue = 0;
+    
+    switch (operationType) {
+        case "INCREMENT":
+            currentValue = storage.get(counterId);
+            newValue = currentValue + delta;
+            storage.put(counterId, newValue);
+            break;
+            
+        case "DECREMENT":
+            currentValue = storage.get(counterId);
+            newValue = currentValue - delta;
+            storage.put(counterId, newValue);
+            break;
+            
+        case "GET_TOTAL":
+            newValue = storage.get(counterId);
+            break;
+            
+        default:
+            return createShardedResponse(HttpResponseStatus.BAD_REQUEST, 
+                    ShardedCounterResponse.error("Unknown operation type: " + operationType));
+    }
+    
+    ShardedCounterResponse response = ShardedCounterResponse.success(newValue, null);
+    return createShardedResponse(HttpResponseStatus.OK, response);
 }
 ```
 
 This implementation ensures:
-- **Thread Safety**: ConcurrentHashMap provides thread-safe operations
+- **Thread Safety**: RocksDB provides thread-safe operations
 - **Atomicity**: Each increment operation is atomic
 - **Persistence**: Values are automatically persisted to RocksDB
-- **Performance**: In-memory operations provide sub-millisecond response times
+- **Performance**: Optimized storage operations
 
 ## Consistent Hashing: The Routing Engine
 
@@ -137,23 +184,25 @@ The consistent hashing implementation is the heart of the routing system, ensuri
 
 ```java
 // From ConsistentHash.java
-public class ConsistentHash {
-    private final TreeMap<Integer, String> hashRing;
-    private final int virtualNodes;
+public class ConsistentHash<T> {
+    private final HashFunction hashFunction;
+    private final int numberOfReplicas;
+    private final SortedMap<Long, T> circle = new TreeMap<>();
+    private final ConcurrentMap<T, Boolean> nodes = new ConcurrentHashMap<>();
     
-    public String get(String key) {
-        if (hashRing.isEmpty()) {
+    public T get(Object key) {
+        if (circle.isEmpty()) {
             return null;
         }
         
-        int hash = hash(key);
-        Map.Entry<Integer, String> entry = hashRing.ceilingEntry(hash);
+        long hash = hashFunction.hash(key.toString());
         
-        if (entry == null) {
-            entry = hashRing.firstEntry();
+        if (!circle.containsKey(hash)) {
+            SortedMap<Long, T> tailMap = circle.tailMap(hash);
+            hash = tailMap.isEmpty() ? circle.firstKey() : tailMap.firstKey();
         }
         
-        return entry.getValue();
+        return circle.get(hash);
     }
 }
 ```
@@ -204,17 +253,31 @@ When a shard fails, the coordinator gracefully handles the failure:
 
 ```java
 // From ShardedCounterCoordinator.java
-private ShardedCounterResponse routeToShard(String shardAddress, ShardedCounterOperation operation) {
-    try {
-        // Attempt to route to the target shard
-        return httpClient.post(shardAddress + "/sharded", operation);
-    } catch (Exception e) {
-        // Handle shard failure
-        logger.error("Shard failure: " + shardAddress, e);
+private void checkShardHealth() {
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String address = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
         
-        // For writes, we could implement retry logic or failover
-        // For reads, we continue with available shards
-        return new ShardedCounterResponse(false, 0, null);
+        try {
+            // Send health check request
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create("http://" + address + "/health"))
+                    .timeout(Duration.ofSeconds(2))
+                    .build();
+            
+            HttpResponse<String> response = httpClient.send(request, 
+                    HttpResponse.BodyHandlers.ofString());
+            
+            if (response.statusCode() == 200) {
+                shardInfo.setHealthy(true);
+                shardInfo.setLastSeen(System.currentTimeMillis());
+            } else {
+                shardInfo.setHealthy(false);
+            }
+        } catch (Exception e) {
+            logger.warn("Health check failed for shard: {}", address);
+            shardInfo.setHealthy(false);
+        }
     }
 }
 ```
@@ -224,17 +287,32 @@ private ShardedCounterResponse routeToShard(String shardAddress, ShardedCounterO
 Shards automatically recover their state on startup by loading data from persistent storage:
 
 ```java
-// From ShardNode.java
-private void loadDataFromPersistentStorage() {
-    try {
-        // Load all data from RocksDB into memory
-        for (RocksIterator iterator = persistentStorage.getIterator()) {
-            String key = new String(iterator.key());
-            long value = Long.parseLong(new String(iterator.value()));
-            inMemoryCache.put(key, value);
+// From RocksDBStorage.java
+public class RocksDBStorage {
+    private final RocksDB db;
+    
+    public RocksDBStorage(String dbPath) throws Exception {
+        Options options = new Options();
+        options.setCreateIfMissing(true);
+        this.db = RocksDB.open(options, dbPath);
+    }
+    
+    public long get(String key) {
+        try {
+            byte[] value = db.get(key.getBytes());
+            return value != null ? Long.parseLong(new String(value)) : 0;
+        } catch (Exception e) {
+            logger.error("Error reading from storage", e);
+            return 0;
         }
-    } catch (Exception e) {
-        logger.error("Failed to load data from persistent storage", e);
+    }
+    
+    public void put(String key, long value) {
+        try {
+            db.put(key.getBytes(), String.valueOf(value).getBytes());
+        } catch (Exception e) {
+            logger.error("Error writing to storage", e);
+        }
     }
 }
 ```
@@ -247,13 +325,13 @@ The architecture provides several performance benefits:
 
 - **Parallel Processing**: Writes are distributed across multiple shards
 - **No Lock Contention**: Each shard operates independently
-- **In-Memory Operations**: Fast in-memory updates with async persistence
+- **Optimized Storage**: RocksDB provides high-performance operations
 - **Horizontal Scaling**: Add more shards to increase write capacity
 
 ### Read Performance
 
 - **Parallel Queries**: Coordinator queries all shards in parallel
-- **Caching**: In-memory cache provides fast access to hot data
+- **Caching**: RocksDB block cache provides fast access to hot data
 - **Fault Tolerance**: Continues operating even with shard failures
 - **Eventual Consistency**: Accepts some latency for complete view
 

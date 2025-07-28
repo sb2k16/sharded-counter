@@ -2,613 +2,509 @@
 
 ## Dual-Layer Storage Architecture
 
-The storage layer of the distributed sharded counter system implements a sophisticated dual-layer architecture that combines the speed of in-memory caching with the durability of persistent storage. This approach provides the best of both worlds: sub-millisecond response times for hot data and guaranteed durability for all data.
+The distributed sharded counter system implements a sophisticated dual-layer storage architecture that combines high-performance in-memory caching with persistent RocksDB storage. This architecture provides the best of both worlds: fast access to frequently used data and reliable persistence for data durability.
 
-The storage architecture consists of two primary components:
+### Storage Layer Components
 
-1. **In-Memory Cache**: Fast access layer using ConcurrentHashMap for thread-safe operations
-2. **Persistent Storage**: Durable storage layer using RocksDB for high-performance key-value storage
+The storage layer consists of two main components:
 
-## RocksDB Implementation
-
-RocksDB is a high-performance embedded key-value store that provides excellent write performance and compression. It's particularly well-suited for the distributed sharded counter use case due to its LSM (Log-Structured Merge) tree architecture.
-
-### RocksDB Configuration
+1. **In-Memory Cache**: Fast access to counter values
+2. **RocksDB Storage**: Persistent storage for data durability
 
 ```java
 // From RocksDBStorage.java
-public class RocksDBStorage {
-    private RocksDB db;
+public class RocksDBStorage implements AutoCloseable {
+    private static final Logger logger = LoggerFactory.getLogger(RocksDBStorage.class);
+    
+    private final RocksDB db;
+    private final Map<String, Long> inMemoryCache;
     private final String dbPath;
     
-    public RocksDBStorage(String dbPath) {
+    public RocksDBStorage(String dbPath) throws RocksDBException {
         this.dbPath = dbPath;
-        initializeDatabase();
-    }
-    
-    private void initializeDatabase() {
-        try {
-            Options options = new Options();
-            
-            // Optimize for write-heavy workloads
-            options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
-            options.setMaxWriteBufferNumber(4);
-            options.setMinWriteBufferNumberToMerge(2);
-            
-            // Compression settings
-            options.setCompressionType(CompressionType.LZ4_COMPRESSION);
-            options.setBottommostCompressionType(CompressionType.ZSTD_COMPRESSION);
-            
-            // Bloom filter for faster lookups
-            options.setUseBloomFilter(true);
-            options.setBloomFilterBitsPerKey(10);
-            
-            // Block cache for frequently accessed data
-            options.setBlockCache(new LRUCache(100 * 1024 * 1024)); // 100MB
-            
-            // Create database directory if it doesn't exist
-            Files.createDirectories(Paths.get(dbPath));
-            
-            db = RocksDB.open(options, dbPath);
-            
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to initialize RocksDB", e);
+        this.inMemoryCache = new ConcurrentHashMap<>();
+        
+        // Create directory if it doesn't exist
+        File directory = new File(dbPath);
+        if (!directory.exists()) {
+            directory.mkdirs();
         }
+        
+        // Configure RocksDB options
+        Options options = new Options();
+        options.setCreateIfMissing(true);
+        options.setMaxBackgroundJobs(4);
+        options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
+        options.setMaxWriteBufferNumber(3);
+        options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
+        
+        // Open the database
+        this.db = RocksDB.open(options, dbPath);
+        
+        // Load existing data into memory
+        loadDataIntoMemory();
+        
+        logger.info("RocksDB storage initialized at: {}", dbPath);
     }
 }
 ```
 
-The RocksDB configuration is optimized for:
+## RocksDB Configuration and Setup
 
-- **Write Performance**: Large write buffers and multiple write buffers
-- **Read Performance**: Bloom filters and block cache
-- **Storage Efficiency**: LZ4 compression for active data, ZSTD for older data
-- **Memory Usage**: Configurable block cache size
+RocksDB is configured for optimal performance in the distributed counter use case:
 
-### Key-Value Operations
+### Database Configuration
 
 ```java
 // From RocksDBStorage.java
-public class RocksDBStorage {
-    
-    public void put(String key, String value) {
-        try {
-            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-            byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
-            db.put(keyBytes, valueBytes);
-        } catch (Exception e) {
-            throw new StorageException("Failed to write to RocksDB", e);
-        }
-    }
-    
-    public String get(String key) {
-        try {
-            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-            byte[] valueBytes = db.get(keyBytes);
+Options options = new Options();
+options.setCreateIfMissing(true);
+options.setMaxBackgroundJobs(4);
+options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
+options.setMaxWriteBufferNumber(3);
+options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
+```
+
+This configuration provides:
+- **High Write Throughput**: Large write buffers for batch operations
+- **Background Processing**: Multiple background jobs for compaction
+- **Memory Efficiency**: Optimized buffer sizes for the workload
+- **Durability**: Automatic data persistence and recovery
+
+### Data Loading on Startup
+
+When a shard starts up, it loads all existing data from RocksDB into the in-memory cache:
+
+```java
+// From RocksDBStorage.java
+private void loadDataIntoMemory() {
+    try (RocksIterator iterator = db.newIterator()) {
+        iterator.seekToFirst();
+        int loadedCount = 0;
+        
+        while (iterator.isValid()) {
+            String key = new String(iterator.key(), StandardCharsets.UTF_8);
+            String value = new String(iterator.value(), StandardCharsets.UTF_8);
+            Long count = Long.parseLong(value);
             
-            if (valueBytes == null) {
-                return null;
-            }
-            
-            return new String(valueBytes, StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            throw new StorageException("Failed to read from RocksDB", e);
+            inMemoryCache.put(key, count);
+            loadedCount++;
+            iterator.next();
         }
-    }
-    
-    public void delete(String key) {
-        try {
-            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-            db.remove(keyBytes);
-        } catch (Exception e) {
-            throw new StorageException("Failed to delete from RocksDB", e);
-        }
-    }
-    
-    public RocksIterator getIterator() {
-        return db.newIterator();
+        
+        logger.info("Loaded {} counters from RocksDB into memory", loadedCount);
     }
 }
 ```
 
-### Batch Operations
+This ensures that:
+- **Fast Recovery**: All data is immediately available in memory
+- **Consistency**: No data loss during restarts
+- **Performance**: Sub-millisecond access to all counter values
 
-For high-throughput scenarios, RocksDB supports batch operations:
+## Key-Value Operations
+
+The storage layer provides atomic key-value operations for counter management:
+
+### Increment Operations
 
 ```java
 // From RocksDBStorage.java
-public class RocksDBStorage {
+public long increment(String counterId, long delta) throws RocksDBException {
+    // Update in-memory cache
+    long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
+        long current = (oldValue != null) ? oldValue : 0;
+        return current + delta;
+    });
     
-    public void batchWrite(Map<String, String> keyValuePairs) {
-        try (WriteBatch batch = new WriteBatch()) {
-            for (Map.Entry<String, String> entry : keyValuePairs.entrySet()) {
-                byte[] keyBytes = entry.getKey().getBytes(StandardCharsets.UTF_8);
-                byte[] valueBytes = entry.getValue().getBytes(StandardCharsets.UTF_8);
-                batch.put(keyBytes, valueBytes);
-            }
-            
-            WriteOptions writeOptions = new WriteOptions();
-            writeOptions.setSync(false); // Asynchronous writes for performance
-            db.write(writeOptions, batch);
-            
-        } catch (Exception e) {
-            throw new StorageException("Failed to perform batch write", e);
-        }
+    // Persist to RocksDB
+    WriteOptions writeOptions = new WriteOptions();
+    writeOptions.setSync(true); // Ensure durability
+    
+    db.put(writeOptions, 
+           counterId.getBytes(StandardCharsets.UTF_8),
+           String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
+    
+    logger.debug("Incremented counter {} by {}, new value: {}", counterId, delta, newValue);
+    return newValue;
+}
+```
+
+### Decrement Operations
+
+```java
+// From RocksDBStorage.java
+public long decrement(String counterId, long delta) throws RocksDBException {
+    // Update in-memory cache
+    long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
+        long current = (oldValue != null) ? oldValue : 0;
+        return current - delta;
+    });
+    
+    // Persist to RocksDB
+    WriteOptions writeOptions = new WriteOptions();
+    writeOptions.setSync(true); // Ensure durability
+    
+    db.put(writeOptions, 
+           counterId.getBytes(StandardCharsets.UTF_8),
+           String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
+    
+    logger.debug("Decremented counter {} by {}, new value: {}", counterId, delta, newValue);
+    return newValue;
+}
+```
+
+### Read Operations
+
+```java
+// From RocksDBStorage.java
+public long get(String counterId) throws RocksDBException {
+    // First check in-memory cache
+    Long cachedValue = inMemoryCache.get(counterId);
+    if (cachedValue != null) {
+        return cachedValue;
     }
     
-    public Map<String, String> batchRead(List<String> keys) {
-        Map<String, String> results = new HashMap<>();
-        
-        try {
-            List<byte[]> keyBytes = keys.stream()
-                .map(key -> key.getBytes(StandardCharsets.UTF_8))
-                .collect(Collectors.toList());
-            
-            List<byte[]> valueBytes = db.multiGetAsList(keyBytes);
-            
-            for (int i = 0; i < keys.size(); i++) {
-                if (valueBytes.get(i) != null) {
-                    String value = new String(valueBytes.get(i), StandardCharsets.UTF_8);
-                    results.put(keys.get(i), value);
-                }
-            }
-            
-        } catch (Exception e) {
-            throw new StorageException("Failed to perform batch read", e);
-        }
-        
-        return results;
+    // Fall back to RocksDB
+    byte[] value = db.get(counterId.getBytes(StandardCharsets.UTF_8));
+    if (value != null) {
+        long dbValue = Long.parseLong(new String(value, StandardCharsets.UTF_8));
+        // Update cache for future reads
+        inMemoryCache.put(counterId, dbValue);
+        return dbValue;
     }
+    
+    return 0; // Default value for non-existent counters
+}
+```
+
+## Batch Operations
+
+For high-throughput scenarios, the system supports batch operations:
+
+```java
+// Conceptual batch operations
+public void batchIncrement(Map<String, Long> increments) throws RocksDBException {
+    WriteBatch batch = new WriteBatch();
+    
+    for (Map.Entry<String, Long> entry : increments.entrySet()) {
+        String counterId = entry.getKey();
+        long delta = entry.getValue();
+        
+        // Update in-memory cache
+        long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
+            long current = (oldValue != null) ? oldValue : 0;
+            return current + delta;
+        });
+        
+        // Add to batch
+        batch.put(counterId.getBytes(StandardCharsets.UTF_8),
+                 String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
+    }
+    
+    // Execute batch
+    WriteOptions writeOptions = new WriteOptions();
+    writeOptions.setSync(true);
+    db.write(writeOptions, batch);
 }
 ```
 
 ## In-Memory Cache Management
 
-The in-memory cache provides fast access to frequently accessed data and serves as a write-through cache for the persistent storage layer.
+The in-memory cache provides fast access to frequently used counter values:
 
 ### Cache Implementation
 
 ```java
-// From ShardNode.java
-public class ShardNode {
-    private final Map<String, Long> inMemoryCache;
-    private final RocksDBStorage persistentStorage;
-    private final CacheMetrics cacheMetrics;
-    
-    public ShardNode() {
-        this.inMemoryCache = new ConcurrentHashMap<>();
-        this.persistentStorage = new RocksDBStorage("shard_data");
-        this.cacheMetrics = new CacheMetrics();
-        loadDataFromPersistentStorage();
-    }
-    
-    public long increment(String counterId, long delta) {
-        return inMemoryCache.compute(counterId, (key, oldValue) -> {
-            long current = (oldValue != null) ? oldValue : 0;
-            long newValue = current + delta;
-            
-            // Asynchronous persistence
-            CompletableFuture.runAsync(() -> {
-                persistentStorage.put(counterId, String.valueOf(newValue));
-                cacheMetrics.recordWrite();
-            });
-            
-            cacheMetrics.recordHit();
-            return newValue;
-        });
-    }
-    
-    public long getValue(String counterId) {
-        Long value = inMemoryCache.get(counterId);
-        
-        if (value != null) {
-            cacheMetrics.recordHit();
-            return value;
-        }
-        
-        // Cache miss - load from persistent storage
-        String persistedValue = persistentStorage.get(counterId);
-        if (persistedValue != null) {
-            long longValue = Long.parseLong(persistedValue);
-            inMemoryCache.put(counterId, longValue);
-            cacheMetrics.recordMiss();
-            return longValue;
-        }
-        
-        cacheMetrics.recordMiss();
-        return 0;
-    }
+// From RocksDBStorage.java
+private final Map<String, Long> inMemoryCache;
+
+public RocksDBStorage(String dbPath) throws RocksDBException {
+    this.inMemoryCache = new ConcurrentHashMap<>();
+    // ... other initialization
 }
 ```
 
+The cache provides:
+- **Thread Safety**: ConcurrentHashMap ensures thread-safe access
+- **Fast Access**: O(1) lookup time for cached values
+- **Memory Efficiency**: Only stores active counter values
+- **Automatic Loading**: All data loaded on startup
+
 ### Cache Performance Monitoring
 
+The system provides monitoring capabilities for cache performance:
+
 ```java
-// From CacheMetrics.java
-public class CacheMetrics {
-    private final AtomicLong hitCount = new AtomicLong();
-    private final AtomicLong missCount = new AtomicLong();
-    private final AtomicLong writeCount = new AtomicLong();
-    private final AtomicLong evictionCount = new AtomicLong();
-    
-    public void recordHit() {
-        hitCount.incrementAndGet();
-    }
-    
-    public void recordMiss() {
-        missCount.incrementAndGet();
-    }
-    
-    public void recordWrite() {
-        writeCount.incrementAndGet();
-    }
-    
-    public void recordEviction() {
-        evictionCount.incrementAndGet();
-    }
-    
-    public double getHitRate() {
-        long hits = hitCount.get();
-        long misses = missCount.get();
-        long total = hits + misses;
-        
-        return total > 0 ? (double) hits / total : 0.0;
-    }
-    
-    public CacheStats getStats() {
-        return new CacheStats(
-            hitCount.get(),
-            missCount.get(),
-            writeCount.get(),
-            evictionCount.get(),
-            getHitRate()
-        );
-    }
+// From RocksDBStorage.java
+public int getCacheSize() {
+    return inMemoryCache.size();
+}
+
+public Map<String, Long> getAllCounters() {
+    return new HashMap<>(inMemoryCache);
 }
 ```
 
 ## Persistence Strategies
 
-The system implements several persistence strategies to balance performance with durability.
+The system implements several persistence strategies to balance performance and durability:
 
-### Write-Through Caching
+### Write-Through Strategy
+
+The default strategy ensures immediate persistence:
 
 ```java
-// From ShardNode.java
-public class WriteThroughCache {
-    private final Map<String, Long> cache;
-    private final RocksDBStorage storage;
-    
-    public long increment(String counterId, long delta) {
-        return cache.compute(counterId, (key, oldValue) -> {
-            long current = (oldValue != null) ? oldValue : 0;
-            long newValue = current + delta;
-            
-            // Synchronous write to storage
-            storage.put(counterId, String.valueOf(newValue));
-            
-            return newValue;
-        });
-    }
-}
+// From RocksDBStorage.java
+WriteOptions writeOptions = new WriteOptions();
+writeOptions.setSync(true); // Ensure durability
+
+db.put(writeOptions, 
+       counterId.getBytes(StandardCharsets.UTF_8),
+       String.valueOf(newValue).getBytes(StandardCharsets.UTF_8));
 ```
 
-Write-through caching provides:
-- **Strong Durability**: Data is immediately persisted
-- **Consistency**: Cache and storage are always in sync
-- **Lower Performance**: Each write requires disk I/O
+This provides:
+- **Strong Durability**: Data is immediately persisted to disk
+- **Crash Recovery**: No data loss on system crashes
+- **Consistency**: ACID properties for all operations
 
-### Write-Behind Caching
+### Write-Behind Strategy
+
+For high-performance scenarios, the system can implement write-behind:
 
 ```java
-// From ShardNode.java
-public class WriteBehindCache {
-    private final Map<String, Long> cache;
-    private final RocksDBStorage storage;
-    private final ExecutorService writeExecutor;
-    private final BlockingQueue<WriteOperation> writeQueue;
+// Conceptual write-behind implementation
+public class WriteBehindStorage {
+    private final Queue<WriteOperation> writeQueue = new ConcurrentLinkedQueue<>();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     
-    public WriteBehindCache() {
-        this.cache = new ConcurrentHashMap<>();
-        this.storage = new RocksDBStorage("shard_data");
-        this.writeExecutor = Executors.newSingleThreadExecutor();
-        this.writeQueue = new LinkedBlockingQueue<>();
+    public void incrementAsync(String counterId, long delta) {
+        // Update cache immediately
+        long newValue = inMemoryCache.compute(counterId, (key, oldValue) -> {
+            long current = (oldValue != null) ? oldValue : 0;
+            return current + delta;
+        });
         
-        // Start background writer
-        writeExecutor.submit(this::backgroundWriter);
+        // Queue for background persistence
+        writeQueue.offer(new WriteOperation(counterId, newValue));
     }
     
-    public long increment(String counterId, long delta) {
-        return cache.compute(counterId, (key, oldValue) -> {
-            long current = (oldValue != null) ? oldValue : 0;
-            long newValue = current + delta;
+    private void startBackgroundWriter() {
+        scheduler.scheduleAtFixedRate(() -> {
+            List<WriteOperation> batch = new ArrayList<>();
+            WriteOperation op;
             
-            // Queue for background persistence
-            writeQueue.offer(new WriteOperation(counterId, newValue));
-            
-            return newValue;
-        });
-    }
-    
-    private void backgroundWriter() {
-        while (!Thread.currentThread().isInterrupted()) {
-            try {
-                WriteOperation operation = writeQueue.take();
-                storage.put(operation.getKey(), String.valueOf(operation.getValue()));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            } catch (Exception e) {
-                logger.error("Background write failed", e);
+            // Collect batch of operations
+            while ((op = writeQueue.poll()) != null && batch.size() < 100) {
+                batch.add(op);
             }
-        }
+            
+            if (!batch.isEmpty()) {
+                persistBatch(batch);
+            }
+        }, 0, 100, TimeUnit.MILLISECONDS);
     }
 }
 ```
-
-Write-behind caching provides:
-- **High Performance**: Writes return immediately
-- **Batch Efficiency**: Multiple writes can be batched
-- **Eventual Durability**: Data is persisted asynchronously
-- **Risk of Data Loss**: Recent writes may be lost on crash
 
 ### Adaptive Persistence
 
+The system can adapt persistence strategy based on workload:
+
 ```java
-// From ShardNode.java
-public class AdaptivePersistence {
-    private final Map<String, Long> cache;
-    private final RocksDBStorage storage;
-    private final AtomicLong writeCount = new AtomicLong();
-    private final AtomicLong lastSyncTime = new AtomicLong(System.currentTimeMillis());
+// Conceptual adaptive persistence
+public class AdaptiveStorage {
+    private final AtomicLong writeCount = new AtomicLong(0);
+    private final AtomicLong lastWriteTime = new AtomicLong(0);
     
-    private static final long SYNC_INTERVAL = 1000; // 1 second
-    private static final int SYNC_THRESHOLD = 100; // 100 writes
-    
-    public long increment(String counterId, long delta) {
-        return cache.compute(counterId, (key, oldValue) -> {
-            long current = (oldValue != null) ? oldValue : 0;
-            long newValue = current + delta;
-            
-            // Adaptive persistence based on write frequency
-            if (shouldSync()) {
-                // Synchronous write for high-frequency counters
-                storage.put(counterId, String.valueOf(newValue));
-            } else {
-                // Asynchronous write for low-frequency counters
-                CompletableFuture.runAsync(() -> {
-                    storage.put(counterId, String.valueOf(newValue));
-                });
-            }
-            
-            return newValue;
-        });
-    }
-    
-    private boolean shouldSync() {
+    public void increment(String counterId, long delta) {
+        long currentTime = System.currentTimeMillis();
         long writes = writeCount.incrementAndGet();
-        long now = System.currentTimeMillis();
-        long lastSync = lastSyncTime.get();
         
-        // Sync if threshold reached or time interval passed
-        if (writes >= SYNC_THRESHOLD || (now - lastSync) >= SYNC_INTERVAL) {
-            lastSyncTime.set(now);
-            writeCount.set(0);
-            return true;
+        // Switch to write-behind for high-frequency writes
+        if (writes > 1000 && (currentTime - lastWriteTime.get()) < 1000) {
+            incrementAsync(counterId, delta);
+        } else {
+            incrementSync(counterId, delta);
         }
         
-        return false;
+        lastWriteTime.set(currentTime);
     }
 }
 ```
 
 ## Data Recovery Mechanisms
 
-The system implements comprehensive data recovery mechanisms to handle various failure scenarios.
+The system implements robust data recovery mechanisms:
 
 ### Startup Recovery
 
 ```java
-// From ShardNode.java
-private void loadDataFromPersistentStorage() {
-    try {
-        logger.info("Loading data from persistent storage...");
+// From RocksDBStorage.java
+private void loadDataIntoMemory() {
+    try (RocksIterator iterator = db.newIterator()) {
+        iterator.seekToFirst();
         int loadedCount = 0;
         
-        try (RocksIterator iterator = persistentStorage.getIterator()) {
-            iterator.seekToFirst();
+        while (iterator.isValid()) {
+            String key = new String(iterator.key(), StandardCharsets.UTF_8);
+            String value = new String(iterator.value(), StandardCharsets.UTF_8);
+            Long count = Long.parseLong(value);
             
-            while (iterator.isValid()) {
-                String key = new String(iterator.key(), StandardCharsets.UTF_8);
-                String value = new String(iterator.value(), StandardCharsets.UTF_8);
-                
-                try {
-                    long longValue = Long.parseLong(value);
-                    inMemoryCache.put(key, longValue);
-                    loadedCount++;
-                } catch (NumberFormatException e) {
-                    logger.warn("Invalid counter value for key: " + key);
-                }
-                
-                iterator.next();
-            }
+            inMemoryCache.put(key, count);
+            loadedCount++;
+            iterator.next();
         }
         
-        logger.info("Loaded " + loadedCount + " counters from persistent storage");
-        
-    } catch (Exception e) {
-        logger.error("Failed to load data from persistent storage", e);
-        throw new RuntimeException("Data recovery failed", e);
+        logger.info("Loaded {} counters from RocksDB into memory", loadedCount);
     }
 }
 ```
 
 ### Incremental Recovery
 
+For large datasets, the system can implement incremental recovery:
+
 ```java
-// From ShardNode.java
+// Conceptual incremental recovery
 public class IncrementalRecovery {
-    private final Map<String, Long> cache;
-    private final RocksDBStorage storage;
-    private final AtomicLong lastRecoveryTime = new AtomicLong();
+    private final Set<String> recoveredKeys = new ConcurrentHashSet<>();
     
-    public void performIncrementalRecovery() {
-        long now = System.currentTimeMillis();
-        long lastRecovery = lastRecoveryTime.get();
-        
-        // Only perform recovery if enough time has passed
-        if (now - lastRecovery < 60000) { // 1 minute
-            return;
-        }
-        
-        try {
-            // Find counters in cache but not in storage
-            Set<String> cacheKeys = cache.keySet();
-            Set<String> storageKeys = getStorageKeys();
-            
-            Set<String> missingInStorage = new HashSet<>(cacheKeys);
-            missingInStorage.removeAll(storageKeys);
-            
-            // Persist missing counters
-            for (String key : missingInStorage) {
-                Long value = cache.get(key);
-                if (value != null) {
-                    storage.put(key, String.valueOf(value));
-                }
-            }
-            
-            lastRecoveryTime.set(now);
-            logger.info("Incremental recovery completed, persisted " + missingInStorage.size() + " counters");
-            
-        } catch (Exception e) {
-            logger.error("Incremental recovery failed", e);
-        }
-    }
-    
-    private Set<String> getStorageKeys() {
-        Set<String> keys = new HashSet<>();
-        
-        try (RocksIterator iterator = storage.getIterator()) {
+    public void recoverIncrementally() {
+        try (RocksIterator iterator = db.newIterator()) {
             iterator.seekToFirst();
+            
             while (iterator.isValid()) {
                 String key = new String(iterator.key(), StandardCharsets.UTF_8);
-                keys.add(key);
+                
+                if (!recoveredKeys.contains(key)) {
+                    String value = new String(iterator.value(), StandardCharsets.UTF_8);
+                    Long count = Long.parseLong(value);
+                    
+                    inMemoryCache.put(key, count);
+                    recoveredKeys.add(key);
+                }
+                
                 iterator.next();
             }
         }
-        
-        return keys;
     }
 }
 ```
 
 ## Storage Performance Optimization
 
-The system implements several optimizations to maximize storage performance.
+The system implements several performance optimizations:
 
 ### Memory Management
 
 ```java
-// From ShardNode.java
-public class MemoryManager {
-    private final Map<String, Long> cache;
-    private final long maxCacheSize;
-    private final AtomicLong currentCacheSize = new AtomicLong();
-    
-    public MemoryManager(long maxCacheSize) {
-        this.cache = new ConcurrentHashMap<>();
-        this.maxCacheSize = maxCacheSize;
-    }
-    
-    public long increment(String counterId, long delta) {
-        return cache.compute(counterId, (key, oldValue) -> {
-            long current = (oldValue != null) ? oldValue : 0;
-            long newValue = current + delta;
-            
-            // Check memory usage
-            long estimatedSize = estimateMemoryUsage(counterId, newValue);
-            if (currentCacheSize.addAndGet(estimatedSize) > maxCacheSize) {
-                // Evict least recently used entries
-                evictLRUEntries();
-            }
-            
-            return newValue;
-        });
-    }
-    
-    private void evictLRUEntries() {
-        // Simple LRU eviction - in practice, use a proper LRU cache
-        if (cache.size() > 10000) { // Arbitrary threshold
-            // Remove 10% of entries
-            int entriesToRemove = cache.size() / 10;
-            Iterator<Map.Entry<String, Long>> iterator = cache.entrySet().iterator();
-            
-            for (int i = 0; i < entriesToRemove && iterator.hasNext(); i++) {
-                Map.Entry<String, Long> entry = iterator.next();
-                iterator.remove();
-                currentCacheSize.addAndGet(-estimateMemoryUsage(entry.getKey(), entry.getValue()));
-            }
-        }
-    }
-    
-    private long estimateMemoryUsage(String key, long value) {
-        // Rough estimation of memory usage
-        return key.length() * 2 + 8 + 16; // String overhead + Long + HashMap entry overhead
-    }
-}
+// From RocksDBStorage.java
+Options options = new Options();
+options.setWriteBufferSize(64 * 1024 * 1024); // 64MB
+options.setMaxWriteBufferNumber(3);
+options.setTargetFileSizeBase(64 * 1024 * 1024); // 64MB
 ```
 
 ### Compression and Serialization
 
 ```java
-// From RocksDBStorage.java
+// Conceptual compression implementation
 public class CompressedStorage {
-    private final RocksDB db;
-    private final CompressionCodec codec;
+    private final CompressionType compressionType = CompressionType.LZ4_COMPRESSION;
     
-    public CompressedStorage() {
-        this.codec = new LZ4CompressionCodec();
-        initializeDatabase();
+    public void putCompressed(String key, long value) throws RocksDBException {
+        // Compress value before storage
+        byte[] compressedValue = compress(String.valueOf(value));
+        
+        WriteOptions writeOptions = new WriteOptions();
+        writeOptions.setCompressionType(compressionType);
+        
+        db.put(writeOptions, key.getBytes(), compressedValue);
     }
     
-    public void put(String key, String value) {
-        try {
-            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-            byte[] valueBytes = value.getBytes(StandardCharsets.UTF_8);
-            
-            // Compress value if it's large enough
-            byte[] compressedValue = valueBytes.length > 1024 ? 
-                codec.compress(valueBytes) : valueBytes;
-            
-            db.put(keyBytes, compressedValue);
-            
-        } catch (Exception e) {
-            throw new StorageException("Failed to write compressed data", e);
+    private byte[] compress(String data) {
+        // Implementation of compression
+        return data.getBytes(); // Simplified for example
+    }
+}
+```
+
+### Background Maintenance
+
+```java
+// From RocksDBStorage.java
+public void compact() throws RocksDBException {
+    db.compactRange();
+}
+
+public void flush() throws RocksDBException {
+    db.flush(new FlushOptions());
+}
+```
+
+## Storage Monitoring and Metrics
+
+The system provides comprehensive monitoring capabilities:
+
+### Performance Metrics
+
+```java
+// Conceptual metrics collection
+public class StorageMetrics {
+    private final AtomicLong readCount = new AtomicLong(0);
+    private final AtomicLong writeCount = new AtomicLong(0);
+    private final AtomicLong cacheHitCount = new AtomicLong(0);
+    private final AtomicLong cacheMissCount = new AtomicLong(0);
+    
+    public void recordRead(String counterId) {
+        readCount.incrementAndGet();
+    }
+    
+    public void recordWrite(String counterId) {
+        writeCount.incrementAndGet();
+    }
+    
+    public void recordCacheHit() {
+        cacheHitCount.incrementAndGet();
+    }
+    
+    public void recordCacheMiss() {
+        cacheMissCount.incrementAndGet();
+    }
+    
+    public double getCacheHitRate() {
+        long hits = cacheHitCount.get();
+        long misses = cacheMissCount.get();
+        long total = hits + misses;
+        
+        return total > 0 ? (double) hits / total : 0.0;
+    }
+}
+```
+
+### Health Monitoring
+
+```java
+// From RocksDBStorage.java
+@Override
+public void close() throws Exception {
+    try {
+        if (db != null) {
+            db.close();
         }
+    } catch (Exception e) {
+        logger.error("Error closing RocksDB", e);
+        throw e;
     }
-    
-    public String get(String key) {
-        try {
-            byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
-            byte[] valueBytes = db.get(keyBytes);
-            
-            if (valueBytes == null) {
-                return null;
-            }
-            
-            // Decompress if necessary
-            byte[] decompressedValue = codec.isCompressed(valueBytes) ? 
-                codec.decompress(valueBytes) : valueBytes;
-            
-            return new String(decompressedValue, StandardCharsets.UTF_8);
-            
-        } catch (Exception e) {
-            throw new StorageException("Failed to read compressed data", e);
-        }
-    }
+}
+
+public String getDbPath() {
+    return dbPath;
 }
 ```
 
 ---
 
-*This chapter examined the sophisticated storage layer implementation using RocksDB and in-memory caching. In the next chapter, we'll analyze performance characteristics and optimization strategies for the distributed sharded counter system.* 
+*This chapter explored the sophisticated storage layer architecture that combines in-memory caching with persistent RocksDB storage. In the next chapter, we'll examine performance analysis and optimization strategies for the distributed sharded counter system.* 

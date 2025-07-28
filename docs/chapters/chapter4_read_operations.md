@@ -2,72 +2,110 @@
 
 ## Read Operation Lifecycle
 
-Read operations in the distributed sharded counter system present unique challenges compared to write operations. While writes can be routed to a single shard, reads must aggregate data from all shards to provide a complete view of the counter's total value. This aggregation process introduces complexity in terms of consistency, performance, and fault tolerance.
+Read operations in the distributed sharded counter system present unique challenges compared to write operations. While writes can be routed to a single shard using consistent hashing, reads must aggregate data from all shards to provide a complete view of the counter value.
 
-The read operation lifecycle consists of several phases:
+### Multi-Shard Query Strategy
 
-1. **Client Request Processing**: HTTP request parsing and validation
-2. **Multi-Shard Query Strategy**: Parallel queries to all shards
-3. **Aggregation Algorithm**: Combining results from multiple shards
-4. **Consistency Handling**: Managing eventual consistency
-5. **Response Generation**: Providing aggregated results to client
-
-## Multi-Shard Query Strategy
-
-Unlike write operations that route to a single shard, read operations must query all shards to gather the complete counter value. The coordinator implements a parallel query strategy to minimize latency.
+The coordinator implements a multi-shard query strategy that queries all available shards and aggregates their individual values:
 
 ```java
 // From ShardedCounterCoordinator.java
-public ShardedCounterResponse getTotalValue(String counterId) {
+private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation) {
     Map<String, Long> shardValues = new HashMap<>();
     long totalValue = 0;
-    List<CompletableFuture<ShardResponse>> futures = new ArrayList<>();
+    int successfulResponses = 0;
     
-    // Query all shards in parallel
-    for (String shardAddress : shardAddresses) {
-        CompletableFuture<ShardResponse> future = CompletableFuture.supplyAsync(() -> {
-            try {
-                ShardedCounterResponse response = queryShard(shardAddress, counterId);
-                return new ShardResponse(shardAddress, response, null);
-            } catch (Exception e) {
-                return new ShardResponse(shardAddress, null, e);
-            }
-        });
-        futures.add(future);
-    }
-    
-    // Wait for all responses with timeout
-    try {
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-            .get(5, TimeUnit.SECONDS);
-    } catch (TimeoutException e) {
-        logger.warn("Timeout waiting for shard responses");
-    }
-    
-    // Aggregate results
-    for (CompletableFuture<ShardResponse> future : futures) {
+    // Query all shards for their individual values
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String shardAddress = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
+        
+        if (!shardInfo.isHealthy()) {
+            logger.warn("Skipping unhealthy shard: {}", shardAddress);
+            continue;
+        }
+        
         try {
-            ShardResponse response = future.get();
-            if (response.getError() == null && response.getResponse().isSuccess()) {
-                long shardValue = response.getResponse().getShardValue();
-                shardValues.put(response.getShardAddress(), shardValue);
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+            if (response.isSuccess()) {
+                long shardValue = response.getShardValue();
+                shardValues.put(shardAddress, shardValue);
                 totalValue += shardValue;
+                successfulResponses++;
             }
         } catch (Exception e) {
-            logger.error("Error processing shard response", e);
+            logger.error("Failed to query shard: " + shardAddress, e);
         }
     }
     
-    return new ShardedCounterResponse(true, totalValue, shardValues);
+    if (successfulResponses == 0) {
+        return ShardedCounterResponse.error("No healthy shards available");
+    }
+    
+    return ShardedCounterResponse.success(totalValue, shardValues);
 }
 ```
 
-The parallel query strategy provides several benefits:
+This strategy provides:
+- **Complete View**: Aggregates values from all healthy shards
+- **Fault Tolerance**: Continues operating even if some shards are down
+- **Transparency**: Returns individual shard values for debugging
+- **Health Awareness**: Skips unhealthy shards automatically
 
-- **Reduced Latency**: All shards are queried simultaneously
-- **Fault Tolerance**: Individual shard failures don't block the entire operation
-- **Timeout Handling**: Prevents indefinite waiting for slow shards
-- **Partial Results**: Can return results even if some shards are unavailable
+### Individual Shard Queries
+
+The coordinator queries each shard individually to get its contribution to the total counter value:
+
+```java
+// From ShardedCounterCoordinator.java
+private ShardedCounterResponse queryShard(String shardAddress, String counterId) throws Exception {
+    // Create query operation
+    ShardedCounterOperation queryOp = new ShardedCounterOperation();
+    queryOp.setOperationType("GET_TOTAL");
+    queryOp.setCounterId(counterId);
+    
+    // Send request to shard
+    String jsonRequest = objectMapper.writeValueAsString(queryOp);
+    HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create("http://" + shardAddress + "/sharded"))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(jsonRequest))
+            .timeout(Duration.ofSeconds(5))
+            .build();
+    
+    HttpResponse<String> response = httpClient.send(request, 
+            HttpResponse.BodyHandlers.ofString());
+    
+    if (response.statusCode() == 200) {
+        return objectMapper.readValue(response.body(), ShardedCounterResponse.class);
+    } else {
+        throw new RuntimeException("Shard query failed with status: " + response.statusCode());
+    }
+}
+```
+
+Each shard processes the query by reading from its local storage:
+
+```java
+// From ShardNode.java
+private FullHttpResponse handleShardedOperation(ShardedCounterOperation operation) throws Exception {
+    String counterId = operation.getCounterId();
+    String operationType = operation.getOperationType();
+    
+    long currentValue = 0;
+    
+    switch (operationType) {
+        case "GET_TOTAL":
+            currentValue = storage.get(counterId);
+            break;
+            
+        // ... other operation types
+    }
+    
+    ShardedCounterResponse response = ShardedCounterResponse.success(currentValue, null);
+    return createShardedResponse(HttpResponseStatus.OK, response);
+}
+```
 
 ## Aggregation Algorithms
 
@@ -75,328 +113,418 @@ The system implements several aggregation strategies depending on the consistenc
 
 ### Simple Sum Aggregation
 
-The most straightforward aggregation algorithm simply sums the values from all available shards:
+The default aggregation strategy is a simple sum of all shard values:
 
 ```java
 // From ShardedCounterCoordinator.java
-private long aggregateShardValues(Map<String, Long> shardValues) {
-    return shardValues.values().stream()
-        .mapToLong(Long::longValue)
-        .sum();
+private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation) {
+    Map<String, Long> shardValues = new HashMap<>();
+    long totalValue = 0;
+    int successfulResponses = 0;
+    
+    // Query all shards and sum their values
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String shardAddress = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
+        
+        if (!shardInfo.isHealthy()) {
+            continue;
+        }
+        
+        try {
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+            if (response.isSuccess()) {
+                long shardValue = response.getShardValue();
+                shardValues.put(shardAddress, shardValue);
+                totalValue += shardValue;
+                successfulResponses++;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to query shard: " + shardAddress, e);
+        }
+    }
+    
+    return ShardedCounterResponse.success(totalValue, shardValues);
 }
 ```
 
 This approach provides:
-- **Simplicity**: Easy to understand and implement
-- **Performance**: Fast aggregation with minimal overhead
-- **Fault Tolerance**: Continues working even if some shards fail
+- **Simplicity**: Easy to understand and debug
+- **Performance**: Minimal computation overhead
+- **Fault Tolerance**: Continues with available shards
+- **Transparency**: Shows individual shard contributions
 
 ### Weighted Aggregation
 
-For systems with different shard capacities or reliability, weighted aggregation can be used:
+For scenarios where shards have different reliability or performance characteristics, the system can implement weighted aggregation:
 
 ```java
-// From ShardedCounterCoordinator.java
-private long aggregateWithWeights(Map<String, Long> shardValues, Map<String, Double> weights) {
+// Conceptual weighted aggregation
+private ShardedCounterResponse handleGetTotalWeighted(ShardedCounterOperation operation) {
+    Map<String, Long> shardValues = new HashMap<>();
+    long totalValue = 0;
     double totalWeight = 0;
-    double weightedSum = 0;
     
-    for (Map.Entry<String, Long> entry : shardValues.entrySet()) {
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
         String shardAddress = entry.getKey();
-        long value = entry.getValue();
-        double weight = weights.getOrDefault(shardAddress, 1.0);
+        ShardInfo shardInfo = entry.getValue();
         
-        weightedSum += value * weight;
-        totalWeight += weight;
+        if (!shardInfo.isHealthy()) {
+            continue;
+        }
+        
+        try {
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+            if (response.isSuccess()) {
+                long shardValue = response.getShardValue();
+                double weight = calculateShardWeight(shardInfo);
+                
+                shardValues.put(shardAddress, shardValue);
+                totalValue += (shardValue * weight);
+                totalWeight += weight;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to query shard: " + shardAddress, e);
+        }
     }
     
-    return totalWeight > 0 ? (long) (weightedSum / totalWeight) : 0;
+    if (totalWeight > 0) {
+        totalValue = (long) (totalValue / totalWeight);
+    }
+    
+    return ShardedCounterResponse.success(totalValue, shardValues);
+}
+
+private double calculateShardWeight(ShardInfo shardInfo) {
+    // Weight based on health, performance, and reliability
+    double weight = 1.0;
+    
+    // Reduce weight for recently failed shards
+    if (shardInfo.getLastSeen() < System.currentTimeMillis() - 60000) {
+        weight *= 0.5;
+    }
+    
+    return weight;
 }
 ```
 
 ### Consensus-Based Aggregation
 
-For higher consistency requirements, the system can implement consensus-based aggregation:
+For high-consistency requirements, the system can implement consensus-based aggregation:
 
 ```java
-// From ShardedCounterCoordinator.java
-private ShardedCounterResponse aggregateWithConsensus(Map<String, Long> shardValues, int minResponses) {
-    if (shardValues.size() < minResponses) {
-        return new ShardedCounterResponse(false, 0, "Insufficient shard responses");
-    }
+// Conceptual consensus-based aggregation
+private ShardedCounterResponse handleGetTotalConsensus(ShardedCounterOperation operation) {
+    Map<String, Long> shardValues = new HashMap<>();
+    List<Long> allValues = new ArrayList<>();
     
-    // Calculate median to handle outliers
-    List<Long> values = new ArrayList<>(shardValues.values());
-    Collections.sort(values);
-    long median = values.get(values.size() / 2);
-    
-    // Check if values are within acceptable range
-    long total = 0;
-    int validResponses = 0;
-    for (Long value : values) {
-        if (Math.abs(value - median) <= median * 0.1) { // Within 10% of median
-            total += value;
-            validResponses++;
+    // Collect all shard values
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String shardAddress = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
+        
+        if (!shardInfo.isHealthy()) {
+            continue;
+        }
+        
+        try {
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+            if (response.isSuccess()) {
+                long shardValue = response.getShardValue();
+                shardValues.put(shardAddress, shardValue);
+                allValues.add(shardValue);
+            }
+        } catch (Exception e) {
+            logger.error("Failed to query shard: " + shardAddress, e);
         }
     }
     
-    if (validResponses < minResponses) {
-        return new ShardedCounterResponse(false, 0, "Inconsistent shard responses");
+    // Calculate consensus value (median for robustness)
+    if (allValues.isEmpty()) {
+        return ShardedCounterResponse.error("No shards available");
     }
     
-    return new ShardedCounterResponse(true, total, shardValues);
+    Collections.sort(allValues);
+    long consensusValue = allValues.get(allValues.size() / 2);
+    
+    return ShardedCounterResponse.success(consensusValue, shardValues);
 }
 ```
 
 ## Eventual Consistency Model
 
-The distributed nature of the system means that read operations operate under an eventual consistency model. This has important implications for application design.
+The distributed nature of the system means that read operations follow an eventual consistency model:
 
-### Understanding Eventual Consistency
+### Consistency Characteristics
 
-```java
-// Example of eventual consistency behavior
-public void demonstrateEventualConsistency() {
-    // Write to shard 1
-    increment("global_likes", 5); // Shard 1: 5
-    
-    // Immediate read might not see the update
-    long immediateRead = getTotalValue("global_likes"); // Might return 0
-    
-    // After some time, the read will see the update
-    Thread.sleep(100);
-    long eventualRead = getTotalValue("global_likes"); // Will return 5
-}
-```
-
-The eventual consistency model provides:
-
-- **High Availability**: System continues operating even with network partitions
-- **High Performance**: No coordination overhead between shards
-- **Scalability**: Can add shards without coordination complexity
+- **Shard-Level Consistency**: Each shard maintains consistent state internally
+- **Cross-Shard Eventual Consistency**: Total values eventually converge across all shards
+- **Read-Your-Writes**: Writes are immediately visible to subsequent reads on the same shard
+- **Monotonic Reads**: Within a single shard, reads are monotonically consistent
 
 ### Consistency Levels
 
-The system supports different consistency levels:
+The system can implement different consistency levels based on requirements:
 
 ```java
 // From ShardedCounterCoordinator.java
 public enum ConsistencyLevel {
-    EVENTUAL,      // Return results from available shards
-    QUORUM,        // Require majority of shards to respond
-    STRONG         // Require all shards to respond
+    EVENTUAL,    // Return immediately with available data
+    QUORUM,      // Wait for majority of shards
+    STRONG       // Wait for all shards
 }
 
-public ShardedCounterResponse getTotalValueWithConsistency(String counterId, ConsistencyLevel level) {
-    Map<String, Long> shardValues = queryAllShards(counterId);
+private ShardedCounterResponse handleGetTotalWithConsistency(ShardedCounterOperation operation, 
+        ConsistencyLevel consistencyLevel) {
+    Map<String, Long> shardValues = new HashMap<>();
+    long totalValue = 0;
+    int successfulResponses = 0;
+    int totalShards = shards.size();
     
-    switch (level) {
+    // Query all shards
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
+        String shardAddress = entry.getKey();
+        ShardInfo shardInfo = entry.getValue();
+        
+        if (!shardInfo.isHealthy()) {
+            continue;
+        }
+        
+        try {
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+            if (response.isSuccess()) {
+                long shardValue = response.getShardValue();
+                shardValues.put(shardAddress, shardValue);
+                totalValue += shardValue;
+                successfulResponses++;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to query shard: " + shardAddress, e);
+        }
+    }
+    
+    // Apply consistency level requirements
+    switch (consistencyLevel) {
         case EVENTUAL:
-            return aggregateShardValues(shardValues);
+            // Return immediately with available data
+            break;
             
         case QUORUM:
-            int requiredResponses = (shardAddresses.size() / 2) + 1;
-            if (shardValues.size() < requiredResponses) {
-                return new ShardedCounterResponse(false, 0, "Quorum not reached");
+            // Wait for majority of shards
+            if (successfulResponses < (totalShards / 2) + 1) {
+                return ShardedCounterResponse.error("Quorum not reached");
             }
-            return aggregateShardValues(shardValues);
+            break;
             
         case STRONG:
-            if (shardValues.size() < shardAddresses.size()) {
-                return new ShardedCounterResponse(false, 0, "Not all shards responded");
+            // Wait for all shards
+            if (successfulResponses < totalShards) {
+                return ShardedCounterResponse.error("Not all shards available");
             }
-            return aggregateShardValues(shardValues);
-            
-        default:
-            throw new IllegalArgumentException("Unknown consistency level");
+            break;
     }
+    
+    return ShardedCounterResponse.success(totalValue, shardValues);
 }
 ```
 
 ## Fault Tolerance in Reads
 
-Read operations must handle various failure scenarios gracefully.
+Read operations must handle shard failures gracefully while maintaining data availability.
 
 ### Shard Failure Handling
 
+When shards fail, the coordinator continues operating with available shards:
+
 ```java
 // From ShardedCounterCoordinator.java
-private ShardedCounterResponse handleShardFailures(Map<String, ShardResponse> responses) {
-    Map<String, Long> successfulResponses = new HashMap<>();
-    List<String> failedShards = new ArrayList<>();
+private ShardedCounterResponse handleGetTotal(ShardedCounterOperation operation) {
+    Map<String, Long> shardValues = new HashMap<>();
+    long totalValue = 0;
+    int successfulResponses = 0;
     
-    for (Map.Entry<String, ShardResponse> entry : responses.entrySet()) {
+    // Query all shards, skipping unhealthy ones
+    for (Map.Entry<String, ShardInfo> entry : shards.entrySet()) {
         String shardAddress = entry.getKey();
-        ShardResponse response = entry.getValue();
+        ShardInfo shardInfo = entry.getValue();
         
-        if (response.getError() != null) {
-            failedShards.add(shardAddress);
-            logger.warn("Shard failed: " + shardAddress + ", error: " + response.getError().getMessage());
-        } else if (response.getResponse().isSuccess()) {
-            successfulResponses.put(shardAddress, response.getResponse().getShardValue());
+        if (!shardInfo.isHealthy()) {
+            logger.warn("Skipping unhealthy shard: {}", shardAddress);
+            continue;
+        }
+        
+        try {
+            ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+            if (response.isSuccess()) {
+                long shardValue = response.getShardValue();
+                shardValues.put(shardAddress, shardValue);
+                totalValue += shardValue;
+                successfulResponses++;
+            }
+        } catch (Exception e) {
+            logger.error("Failed to query shard: " + shardAddress, e);
         }
     }
     
-    // Continue with available shards
-    if (successfulResponses.isEmpty()) {
-        return new ShardedCounterResponse(false, 0, "All shards failed");
+    // Ensure we have at least some healthy shards
+    if (successfulResponses == 0) {
+        return ShardedCounterResponse.error("No healthy shards available");
     }
     
-    long totalValue = aggregateShardValues(successfulResponses);
-    return new ShardedCounterResponse(true, totalValue, successfulResponses);
+    return ShardedCounterResponse.success(totalValue, shardValues);
 }
 ```
 
 ### Timeout and Retry Logic
 
+The system implements timeout and retry logic for read operations:
+
 ```java
 // From ShardedCounterCoordinator.java
-private ShardedCounterResponse queryShardWithRetry(String shardAddress, String counterId) {
-    int maxRetries = 2;
-    int retryCount = 0;
+private ShardedCounterResponse queryShard(String shardAddress, String counterId) throws Exception {
+    ShardedCounterOperation queryOp = new ShardedCounterOperation();
+    queryOp.setOperationType("GET_TOTAL");
+    queryOp.setCounterId(counterId);
     
-    while (retryCount <= maxRetries) {
-        try {
-            return httpClient.get(shardAddress + "/sharded/" + counterId)
-                .timeout(2, TimeUnit.SECONDS)
-                .execute();
-        } catch (TimeoutException e) {
-            logger.warn("Timeout querying shard: " + shardAddress + ", retry: " + retryCount);
-            retryCount++;
-            if (retryCount <= maxRetries) {
-                Thread.sleep(100 * retryCount);
-            }
-        } catch (Exception e) {
-            logger.error("Error querying shard: " + shardAddress, e);
-            break;
-        }
+    String jsonRequest = objectMapper.writeValueAsString(queryOp);
+    HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create("http://" + shardAddress + "/sharded"))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(jsonRequest))
+            .timeout(Duration.ofSeconds(5))  // 5-second timeout
+            .build();
+    
+    HttpResponse<String> response = httpClient.send(request, 
+            HttpResponse.BodyHandlers.ofString());
+    
+    if (response.statusCode() == 200) {
+        return objectMapper.readValue(response.body(), ShardedCounterResponse.class);
+    } else {
+        throw new RuntimeException("Shard query failed with status: " + response.statusCode());
     }
-    
-    return new ShardedCounterResponse(false, 0, "Shard unavailable");
 }
 ```
 
 ## Performance Trade-offs
 
-Read operations involve several performance trade-offs that must be carefully considered.
+Read operations involve several performance trade-offs that must be carefully balanced:
 
-### Latency vs Completeness
+### Latency vs. Completeness
+
+- **Low Latency**: Return immediately with available data (eventual consistency)
+- **High Completeness**: Wait for all shards (strong consistency)
+- **Balanced Approach**: Wait for majority of shards (quorum consistency)
+
+### Parallel vs. Sequential Queries
+
+The system queries shards in parallel for optimal performance:
 
 ```java
-// From ShardedCounterCoordinator.java
-public ShardedCounterResponse getTotalValueWithTimeout(String counterId, long timeoutMs) {
-    Map<String, Long> shardValues = new HashMap<>();
-    long totalValue = 0;
+// Conceptual parallel query implementation
+private ShardedCounterResponse handleGetTotalParallel(ShardedCounterOperation operation) {
+    Map<String, Long> shardValues = new ConcurrentHashMap<>();
+    AtomicLong totalValue = new AtomicLong(0);
+    AtomicInteger successfulResponses = new AtomicInteger(0);
     
-    // Query shards with individual timeouts
-    List<CompletableFuture<ShardResponse>> futures = shardAddresses.stream()
-        .map(shardAddress -> CompletableFuture.supplyAsync(() -> 
-            queryShardWithTimeout(shardAddress, counterId, timeoutMs)))
-        .collect(Collectors.toList());
-    
-    // Wait for responses with overall timeout
-    try {
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-            .get(timeoutMs, TimeUnit.MILLISECONDS);
-    } catch (TimeoutException e) {
-        logger.warn("Overall timeout reached, proceeding with available responses");
-    }
-    
-    // Aggregate available responses
-    for (CompletableFuture<ShardResponse> future : futures) {
-        if (future.isDone()) {
-            try {
-                ShardResponse response = future.get();
-                if (response.getResponse().isSuccess()) {
-                    shardValues.put(response.getShardAddress(), response.getResponse().getShardValue());
-                    totalValue += response.getResponse().getShardValue();
+    // Query all shards in parallel
+    List<CompletableFuture<Void>> futures = shards.entrySet().stream()
+            .map(entry -> CompletableFuture.runAsync(() -> {
+                String shardAddress = entry.getKey();
+                ShardInfo shardInfo = entry.getValue();
+                
+                if (!shardInfo.isHealthy()) {
+                    return;
                 }
-            } catch (Exception e) {
-                logger.error("Error processing shard response", e);
-            }
-        }
+                
+                try {
+                    ShardedCounterResponse response = queryShard(shardAddress, operation.getCounterId());
+                    if (response.isSuccess()) {
+                        long shardValue = response.getShardValue();
+                        shardValues.put(shardAddress, shardValue);
+                        totalValue.addAndGet(shardValue);
+                        successfulResponses.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    logger.error("Failed to query shard: " + shardAddress, e);
+                }
+            }))
+            .collect(Collectors.toList());
+    
+    // Wait for all queries to complete
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+    
+    if (successfulResponses.get() == 0) {
+        return ShardedCounterResponse.error("No healthy shards available");
     }
     
-    return new ShardedCounterResponse(true, totalValue, shardValues);
-}
-```
-
-### Caching Strategies
-
-To improve read performance, the system implements several caching strategies:
-
-```java
-// From ShardedCounterCoordinator.java
-private final Cache<String, ShardedCounterResponse> readCache = CacheBuilder.newBuilder()
-    .maximumSize(10000)
-    .expireAfterWrite(1, TimeUnit.SECONDS)
-    .build();
-
-public ShardedCounterResponse getTotalValueWithCache(String counterId) {
-    // Check cache first
-    ShardedCounterResponse cached = readCache.getIfPresent(counterId);
-    if (cached != null) {
-        return cached;
-    }
-    
-    // Query shards and cache result
-    ShardedCounterResponse response = getTotalValue(counterId);
-    if (response.isSuccess()) {
-        readCache.put(counterId, response);
-    }
-    
-    return response;
+    return ShardedCounterResponse.success(totalValue.get(), shardValues);
 }
 ```
 
 ## Caching Strategies
 
-The system implements multiple caching layers to optimize read performance.
+The system can implement various caching strategies to improve read performance:
 
 ### Coordinator-Level Caching
 
+The coordinator can cache aggregated results to reduce shard queries:
+
 ```java
-// From ShardedCounterCoordinator.java
-public class CoordinatorCache {
-    private final LoadingCache<String, Long> counterCache;
-    private final LoadingCache<String, Map<String, Long>> shardValuesCache;
+// Conceptual coordinator caching
+public class ShardedCounterCoordinator {
+    private final Map<String, CachedResult> resultCache = new ConcurrentHashMap<>();
+    private final long cacheExpiryMs = 1000; // 1 second cache
     
-    public CoordinatorCache() {
-        this.counterCache = CacheBuilder.newBuilder()
-            .maximumSize(10000)
-            .expireAfterWrite(500, TimeUnit.MILLISECONDS)
-            .build(new CacheLoader<String, Long>() {
-                @Override
-                public Long load(String counterId) {
-                    return queryAllShardsAndAggregate(counterId);
-                }
-            });
+    private ShardedCounterResponse handleGetTotalWithCache(ShardedCounterOperation operation) {
+        String cacheKey = operation.getCounterId();
+        CachedResult cached = resultCache.get(cacheKey);
         
-        this.shardValuesCache = CacheBuilder.newBuilder()
-            .maximumSize(5000)
-            .expireAfterWrite(200, TimeUnit.MILLISECONDS)
-            .build(new CacheLoader<String, Map<String, Long>>() {
-                @Override
-                public Map<String, Long> load(String counterId) {
-                    return queryAllShards(counterId);
-                }
-            });
+        if (cached != null && !cached.isExpired()) {
+            return cached.getResponse();
+        }
+        
+        // Query shards and cache result
+        ShardedCounterResponse response = handleGetTotal(operation);
+        resultCache.put(cacheKey, new CachedResult(response, System.currentTimeMillis()));
+        
+        return response;
+    }
+    
+    private static class CachedResult {
+        private final ShardedCounterResponse response;
+        private final long timestamp;
+        private final long expiryMs;
+        
+        public CachedResult(ShardedCounterResponse response, long timestamp) {
+            this.response = response;
+            this.timestamp = timestamp;
+            this.expiryMs = 1000;
+        }
+        
+        public boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > expiryMs;
+        }
+        
+        public ShardedCounterResponse getResponse() {
+            return response;
+        }
     }
 }
 ```
 
 ### Cache Invalidation
 
+Cache invalidation ensures consistency when data changes:
+
 ```java
-// From ShardedCounterCoordinator.java
+// Conceptual cache invalidation
 public void invalidateCache(String counterId) {
-    counterCache.invalidate(counterId);
-    shardValuesCache.invalidate(counterId);
+    resultCache.remove(counterId);
 }
 
 // Called after write operations
-public ShardedCounterResponse handleWriteOperation(ShardedCounterOperation operation) {
-    ShardedCounterResponse response = routeToShard(operation);
+private ShardedCounterResponse handleIncrement(ShardedCounterOperation operation) {
+    ShardedCounterResponse response = routeToShard(targetShard, operation);
     
     if (response.isSuccess()) {
         // Invalidate cache to ensure consistency
@@ -407,42 +535,32 @@ public ShardedCounterResponse handleWriteOperation(ShardedCounterOperation opera
 }
 ```
 
-### Cache Consistency
+### Consistency-Aware Caching
 
-The system must balance cache performance with consistency:
+The system can implement consistency-aware caching that respects consistency levels:
 
 ```java
-// From ShardedCounterCoordinator.java
-public enum CacheConsistencyLevel {
-    STRICT,     // Always invalidate cache on writes
-    RELAXED,    // Allow cache to expire naturally
-    ADAPTIVE    // Adjust based on write frequency
-}
-
-public class AdaptiveCacheManager {
-    private final Map<String, AtomicLong> writeCounters = new ConcurrentHashMap<>();
-    private final Map<String, Long> lastWriteTime = new ConcurrentHashMap<>();
+// Conceptual consistency-aware caching
+private ShardedCounterResponse handleGetTotalWithConsistencyCache(ShardedCounterOperation operation, 
+        ConsistencyLevel consistencyLevel) {
+    String cacheKey = operation.getCounterId() + "_" + consistencyLevel;
+    CachedResult cached = resultCache.get(cacheKey);
     
-    public void recordWrite(String counterId) {
-        writeCounters.computeIfAbsent(counterId, k -> new AtomicLong()).incrementAndGet();
-        lastWriteTime.put(counterId, System.currentTimeMillis());
+    if (cached != null && !cached.isExpired()) {
+        return cached.getResponse();
     }
     
-    public boolean shouldInvalidateCache(String counterId) {
-        AtomicLong counter = writeCounters.get(counterId);
-        if (counter == null) {
-            return false;
-        }
-        
-        long writeCount = counter.get();
-        long timeSinceLastWrite = System.currentTimeMillis() - lastWriteTime.getOrDefault(counterId, 0L);
-        
-        // Invalidate if high write frequency or recent writes
-        return writeCount > 10 || timeSinceLastWrite < 1000;
+    // Query with specified consistency level
+    ShardedCounterResponse response = handleGetTotalWithConsistency(operation, consistencyLevel);
+    
+    if (response.isSuccess()) {
+        resultCache.put(cacheKey, new CachedResult(response, System.currentTimeMillis()));
     }
+    
+    return response;
 }
 ```
 
 ---
 
-*This chapter explored the complexities of read operations in a distributed system, including aggregation strategies, consistency models, and performance optimizations. In the next chapter, we'll examine data replication strategies for achieving stronger consistency guarantees.* 
+*This chapter explored the complexities of read operations in the distributed sharded counter system. In the next chapter, we'll examine data replication strategies for achieving stronger consistency guarantees across the distributed system.* 
